@@ -6,30 +6,25 @@ import { sanitizeFilename } from '../../../apps/local-daemon/src/attachments.js'
 
 let passedTestsCount = 0;
 let failedTestsCount = 0;
+const pendingTests: Promise<void>[] = [];
 
 function test(name: string, fn: () => void | Promise<void>) {
-  try {
-    const res = fn();
-    if (res instanceof Promise) {
-      res.then(() => {
-        console.log(`[PASS] ${name}`);
-        passedTestsCount++;
-      }).catch(err => {
-        console.error(`[FAIL] ${name}:`, err);
-        failedTestsCount++;
-      });
-    } else {
+  pendingTests.push(
+    Promise.resolve()
+      .then(fn)
+      .then(() => {
       console.log(`[PASS] ${name}`);
       passedTestsCount++;
-    }
-  } catch (err) {
-    console.error(`[FAIL] ${name}:`, err);
-    failedTestsCount++;
-  }
+      })
+      .catch(err => {
+        console.error(`[FAIL] ${name}:`, err);
+        failedTestsCount++;
+      })
+  );
 }
 
 async function runAll() {
-  console.log('=== Crypto Pigeon E2EE Test Suite (54-Case Core Cases) ===\n');
+  console.log('=== Crypto Pigeon E2EE Core Test Suite ===\n');
 
   // --- Domain 1: Vault & KDF ---
   test('Case 1-7: Vault Password Strength Validation', () => {
@@ -140,13 +135,11 @@ async function runAll() {
     }
   });
 
-  // Wait a short moment for async logs to print
-  setTimeout(() => {
-    console.log('\n======================================================');
-    console.log(`Test Execution Completed. Passed: ${passedTestsCount}, Failed: ${failedTestsCount}`);
-    console.log('======================================================');
-    process.exitCode = failedTestsCount > 0 ? 1 : 0;
-  }, 100);
+  await Promise.all(pendingTests);
+  console.log('\n======================================================');
+  console.log(`Test Execution Completed. Passed: ${passedTestsCount}, Failed: ${failedTestsCount}`);
+  console.log('======================================================');
+  process.exitCode = failedTestsCount > 0 ? 1 : 0;
 }
 
 runAll().catch(err => {

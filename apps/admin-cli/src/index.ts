@@ -1,9 +1,11 @@
 import crypto from 'node:crypto';
-import argon2 from 'argon2';
 import { Pool } from 'pg';
 import { z } from 'zod';
 
-const env = z.object({ DATABASE_URL: z.string().url() }).parse(process.env);
+const env = z.object({
+  DATABASE_URL: z.string().url(),
+  ACTIVATION_PEPPER: z.string().min(32)
+}).parse(process.env);
 const [command, argument] = process.argv.slice(2);
 const pool = new Pool({ connectionString: env.DATABASE_URL });
 const print = (value: unknown) => process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
@@ -18,7 +20,9 @@ try {
     print(result.rows[0]);
   } else if (command === 'approve' && argument) {
     const activationCode = crypto.randomBytes(16).toString('base64url');
-    const codeHash = await argon2.hash(activationCode, { type: argon2.argon2id, memoryCost: 65536, timeCost: 3, parallelism: 1 });
+    // Must match relay-side activation verification.  The code itself is
+    // terminal-only; the database retains a keyed, versionable HMAC instead.
+    const codeHash = crypto.createHmac('sha256', env.ACTIVATION_PEPPER).update(activationCode).digest('hex');
     const result = await pool.query("UPDATE access_requests SET status='approved',activation_code_hash=$2,activation_expires_at=NOW()+INTERVAL '10 minutes',decided_at=NOW() WHERE request_id=$1 AND status='pending' RETURNING request_id,username,activation_expires_at", [argument, codeHash]);
     if (!result.rows[0]) throw new Error('request_not_pending');
     // Shown once. The code is never written to the database or logs.

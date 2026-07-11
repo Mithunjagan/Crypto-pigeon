@@ -67,7 +67,7 @@ const requireAdminGuard = async (request: FastifyRequest, reply: FastifyReply) =
 // Admin UI Dashboard Routes
 app.post('/api/admin/login', async (request: FastifyRequest, reply: FastifyReply) => {
   const { username, password } = z.object({ username: z.string(), password: z.string() }).parse(request.body);
-  const isValid = username === 'admin' && password === env.ADMIN_TOKEN;
+  const isValid = username === env.ADMIN_USERNAME && password === env.ADMIN_TOKEN;
   if (!isValid) {
     return reply.code(401).send({ error: 'invalid_admin_credentials' });
   }

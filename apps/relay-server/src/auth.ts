@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import type { FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { pool } from './db.js';
-import { env } from './config.js';
+import { env, relayHostname as expectedRelayHostname } from './config.js';
 import { logger } from './logger.js';
 import {
   deviceIdSchema,
@@ -112,6 +112,12 @@ export function setupAuthRoutes(app: any) {
 
     if (Date.now() > stored.expiresAt) {
       return reply.code(401).send({ error: 'challenge_expired' });
+    }
+
+    // The signed host must identify this relay.  Otherwise the host binding
+    // in the challenge response is merely client-controlled text.
+    if (!timingSafeCompare(relayHostname, expectedRelayHostname)) {
+      return reply.code(401).send({ error: 'invalid_relay_hostname' });
     }
 
     // Lookup device's auth_public_key

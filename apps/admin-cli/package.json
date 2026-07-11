@@ -3,6 +3,6 @@
   "private": true,
   "type": "module",
   "scripts": { "start": "tsx src/index.ts", "build": "tsc -p tsconfig.json" },
-  "dependencies": { "argon2": "^0.41.1", "pg": "^8.16.0", "zod": "^3.24.4" },
+  "dependencies": { "pg": "^8.16.0", "zod": "^3.24.4" },
   "devDependencies": { "@types/node": "^22.15.19", "@types/pg": "^8.15.2", "tsx": "^4.19.4", "typescript": "^5.8.3" }
 }

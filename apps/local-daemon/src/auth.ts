@@ -13,6 +13,12 @@ let activeSession: SessionState | null = null;
 let bootstrapSecret: string | null = null;
 let currentPort = 3100;
 
+function safeEqual(left: string, right: string): boolean {
+  const a = Buffer.from(left, 'utf8');
+  const b = Buffer.from(right, 'utf8');
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 export function generateBootstrapSecret(port: number): string {
   currentPort = port;
   bootstrapSecret = crypto.randomBytes(32).toString('hex');
@@ -27,7 +33,7 @@ export function invalidateSession() {
 export function verifyLocalSession(request: FastifyRequest, reply: FastifyReply, vault: Vault) {
   // 1. Check Host header (DNS Rebinding Protection)
   const host = request.headers.host || '';
-  const allowedHosts = [`127.0.0.1:${currentPort}`, `localhost:${currentPort}`];
+  const allowedHosts = [`127.0.0.1:${currentPort}`];
   if (!allowedHosts.includes(host)) {
     return reply.code(403).send({ error: 'invalid_host_header' });
   }
@@ -35,7 +41,7 @@ export function verifyLocalSession(request: FastifyRequest, reply: FastifyReply,
   // 2. Check Origin header (Cross-Origin Protection)
   const origin = request.headers.origin;
   if (origin) {
-    const allowedOrigins = [`http://127.0.0.1:${currentPort}`, `http://localhost:${currentPort}`];
+    const allowedOrigins = [`http://127.0.0.1:${currentPort}`];
     if (!allowedOrigins.includes(origin)) {
       return reply.code(403).send({ error: 'invalid_origin_header' });
     }
@@ -82,7 +88,7 @@ export function setupAuthRoutes(app: any, vault: Vault) {
   app.post('/api/bootstrap', async (request: FastifyRequest, reply: FastifyReply) => {
     const { secret } = request.body as { secret?: string };
     
-    if (!bootstrapSecret || !secret || secret !== bootstrapSecret) {
+    if (!bootstrapSecret || !secret || !safeEqual(secret, bootstrapSecret)) {
       return reply.code(401).send({ error: 'invalid_bootstrap_secret' });
     }
 

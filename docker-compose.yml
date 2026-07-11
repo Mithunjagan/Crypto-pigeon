@@ -22,9 +22,10 @@ services:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql://crypto_pigeon:${POSTGRES_PASSWORD}@postgres:5432/crypto_pigeon
-      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
       ADMIN_USERNAME: ${ADMIN_USERNAME:?set ADMIN_USERNAME in .env}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN in .env}
+      ACTIVATION_PEPPER: ${ACTIVATION_PEPPER:?set ACTIVATION_PEPPER in .env}
+      RELAY_HOSTNAME: 127.0.0.1:8443
       HOST: 0.0.0.0
       PORT: 8443
     ports:

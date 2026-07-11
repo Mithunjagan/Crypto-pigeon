@@ -1,4 +1,7 @@
--- Enable uuid-ossp if not already enabled
+-- UUID generation functions used by DEFAULT gen_random_uuid().
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Retained for deployments that use uuid_generate_v4().
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- 1. Users Table
