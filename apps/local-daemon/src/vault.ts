@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import Database, { setLogger } from '@signalapp/sqlcipher';
 import {
@@ -27,8 +28,14 @@ async function setPlatformPermissions(dir: string, configPath: string, dbPath: s
   const isWindows = process.platform === 'win32';
   if (isWindows) {
     try {
-      // Disable inheritance, grant current user full access
-      await execPromise(`icacls "${dir}" /inheritance:r /grant:r "%USERNAME%":(OI)(CI)F`);
+      // Do not remove ACL inheritance from the live database directory:
+      // SQLite may create a journal/WAL after this point. Protect the vault
+      // files themselves while retaining directory traversal/write rights for
+      // that runtime-created journal.
+      await execPromise(`icacls "${configPath}" /inheritance:r /grant:r "%USERNAME%":F`);
+      if (existsSync(dbPath)) {
+        await execPromise(`icacls "${dbPath}" /inheritance:r /grant:r "%USERNAME%":F`);
+      }
     } catch (e) {
       logger.warn({ err: e }, 'Failed to restrict directory permissions on Windows');
     }
@@ -36,7 +43,7 @@ async function setPlatformPermissions(dir: string, configPath: string, dbPath: s
     try {
       await execPromise(`chmod 700 "${dir}"`);
       await execPromise(`chmod 600 "${configPath}"`);
-      if (require('fs').existsSync(dbPath)) {
+      if (existsSync(dbPath)) {
         await execPromise(`chmod 600 "${dbPath}"`);
       }
     } catch (e) {
@@ -137,11 +144,13 @@ export class Vault {
 
     await writeFile(this.configPath, JSON.stringify(this.config), 'utf8');
 
-    // Restrict permissions
-    await setPlatformPermissions(this.rootDir, this.configPath, this.databasePath);
-
-    // Open & initialize database
+    // Create the encrypted database before tightening the directory ACL.
+    // On Windows, applying an inheritance-breaking ACL first can prevent
+    // SQLCipher from creating chat.db on a newly provisioned vault.
     await this.openDb(vmk, hkdfSalt);
+
+    // Restrict permissions only after config and encrypted database exist.
+    await setPlatformPermissions(this.rootDir, this.configPath, this.databasePath);
 
     // Zeroize VMK
     vmk.fill(0);
@@ -278,6 +287,16 @@ export class Vault {
       CREATE TABLE IF NOT EXISTS relay_auth (
         singleton INTEGER PRIMARY KEY CHECK(singleton=1), 
         access_token TEXT NOT NULL
+      );
+      -- Pending activation is vault state, not browser state.  Keeping the
+      -- request id here lets a restarted UI safely resume the same request.
+      CREATE TABLE IF NOT EXISTS activation_state (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        request_id TEXT NOT NULL,
+        username TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'activated')),
+        expires_at TEXT,
+        updated_at INTEGER NOT NULL
       );
       CREATE TABLE IF NOT EXISTS remote_contacts (
         contact_id TEXT PRIMARY KEY REFERENCES contacts(contact_id) ON DELETE CASCADE, 

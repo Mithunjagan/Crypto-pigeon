@@ -1,8 +1,26 @@
 import { parse } from 'node:url';
-import { signChallenge } from '@crypto-pigeon/protocol';
+import { accessApplyResponseSchema, signChallenge } from '@crypto-pigeon/protocol';
 import type { Vault } from './vault.js';
 import type { LocalSignalStore } from './signal-store.js';
 import { logger } from './logger.js';
+
+export class RelayClientError extends Error {
+  constructor(public readonly status: number, public readonly code: string) {
+    super(code);
+    this.name = 'RelayClientError';
+  }
+}
+
+async function relayError(response: Response): Promise<RelayClientError> {
+  let code = 'RELAY_UNAVAILABLE';
+  try {
+    const body = await response.json() as { error?: string };
+    if (body.error) code = body.error;
+  } catch {
+    // Do not surface or log response bodies; an intermediary might include secrets.
+  }
+  return new RelayClientError(response.status, code);
+}
 
 export class RelayClient {
   private relayUrl: string;
@@ -44,8 +62,7 @@ export class RelayClient {
     });
 
     if (!chalRes.ok) {
-      const errText = await chalRes.text();
-      throw new Error(`Challenge request failed: ${chalRes.status} ${errText}`);
+      throw await relayError(chalRes);
     }
 
     const { challenge } = (await chalRes.json()) as { challenge: string };
@@ -68,8 +85,7 @@ export class RelayClient {
     });
 
     if (!respRes.ok) {
-      const errText = await respRes.text();
-      throw new Error(`Verification response failed: ${respRes.status} ${errText}`);
+      throw await relayError(respRes);
     }
 
     const { sessionToken } = (await respRes.json()) as { sessionToken: string };
@@ -102,23 +118,23 @@ export class RelayClient {
     return res;
   }
 
-  async applyAccess(username: string): Promise<any> {
+  async applyAccess(username: string) {
     const res = await fetch(`${this.relayUrl}/api/access/apply`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username })
     });
-    if (!res.ok) throw new Error(`Access request failed: ${res.statusText}`);
-    return res.json();
+    if (!res.ok) throw await relayError(res);
+    return accessApplyResponseSchema.parse(await res.json());
   }
 
-  async activateAccess(payload: any): Promise<any> {
+  async activateAccess(payload: unknown) {
     const res = await fetch(`${this.relayUrl}/api/access/activate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    if (!res.ok) throw new Error(`Activation failed: ${res.statusText}`);
+    if (!res.ok) throw await relayError(res);
     return res.json();
   }
 }

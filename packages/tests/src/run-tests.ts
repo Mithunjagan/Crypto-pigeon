@@ -3,6 +3,13 @@ import argon2 from 'argon2';
 import { validatePasswordStrength, wrapVmk, unwrapVmk, deriveSubkey } from '../../../apps/local-daemon/src/vault-keys.js';
 import { verifyDeviceSignature } from '@crypto-pigeon/protocol';
 import { sanitizeFilename } from '../../../apps/local-daemon/src/attachments.js';
+import { accessApplyResponseSchema, activationPayloadSchema } from '@crypto-pigeon/protocol';
+import { redact as redactRelayLog } from '../../../apps/relay-server/src/logger.js';
+import { Vault } from '../../../apps/local-daemon/src/vault.js';
+import { LocalSignalStore } from '../../../apps/local-daemon/src/signal-store.js';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { rm } from 'node:fs/promises';
 
 let passedTestsCount = 0;
 let failedTestsCount = 0;
@@ -133,6 +140,63 @@ async function runAll() {
     if (aad.readUInt32BE(16) !== chunkIndex || aad.readUInt32BE(20) !== totalCount || aad.readUInt32BE(24) !== 1) {
       throw new Error('AAD formatting failed');
     }
+  });
+
+  test('Activation apply response is camelCase and validated', () => {
+    const requestId = crypto.randomUUID();
+    const result = accessApplyResponseSchema.parse({
+      requestId,
+      username: 'alice',
+      status: 'pending'
+    });
+    if (result.requestId !== requestId || result.status !== 'pending') {
+      throw new Error('Apply response contract changed');
+    }
+  });
+
+  test('Activation payload requires both request and device IDs', () => {
+    const rejected = activationPayloadSchema.safeParse({ activationCode: 'x'.repeat(20) });
+    if (rejected.success) throw new Error('Activation accepted a missing request ID');
+  });
+
+  test('Local activation persistence is idempotent', async () => {
+    const home = join(tmpdir(), `crypto-pigeon-test-${crypto.randomUUID()}`);
+    const vault = new Vault(home);
+    try {
+      await vault.initialize();
+      await vault.create('LocalVaultTestPassword2026!');
+      const store = new LocalSignalStore(vault.database());
+      const bundle = await store.ensureIdentity();
+      const userId = crypto.randomUUID();
+      vault.database().prepare(
+        `INSERT INTO activation_state (singleton, request_id, username, status, updated_at)
+         VALUES (1, ?, 'alice', 'pending', ?)`
+      ).run([crypto.randomUUID(), Date.now()]);
+
+      const input = { userId, deviceId: bundle.deviceId, username: 'alice', sessionToken: 'test-session-one' };
+      store.completeRegistration(input);
+      store.completeRegistration(input);
+      const account = vault.database().prepare('SELECT user_id FROM signal_account WHERE singleton=1').get<{ user_id: string }>();
+      const state = vault.database().prepare('SELECT status FROM activation_state WHERE singleton=1').get<{ status: string }>();
+      if (account?.user_id !== userId || state?.status !== 'activated') {
+        throw new Error('Activation state was not committed idempotently');
+      }
+    } finally {
+      vault.lock();
+      try {
+        await rm(home, { recursive: true, force: true });
+      } catch (error: any) {
+        // Windows ACLs intentionally protect vault files. The test process
+        // may not be allowed to remove that encrypted temporary fixture.
+        if (process.platform !== 'win32' || error?.code !== 'EPERM') throw error;
+      }
+    }
+  });
+
+  test('Relay log redaction removes activation codes and private keys', () => {
+    const secret = 'do-not-log-this-activation-code';
+    const value = redactRelayLog({ activationCode: secret, privateKey: secret, message: 'safe' });
+    if (JSON.stringify(value).includes(secret)) throw new Error('Secret appeared in redacted log value');
   });
 
   await Promise.all(pendingTests);

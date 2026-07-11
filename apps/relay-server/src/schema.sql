@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS connection_requests (
   status TEXT NOT NULL CHECK(status IN ('pending','accepted','rejected')) DEFAULT 'pending',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at TIMESTAMPTZ NOT NULL,
-  decided_at TIMESTAMPTZ
+  decided_at TIMESTAMPTZ,
+  UNIQUE(requester_user_id, recipient_user_id)
 );
 
 -- 4. Conversation Permissions Table
@@ -57,9 +58,13 @@ CREATE TABLE IF NOT EXISTS device_identity_keys (
   registration_id      INTEGER NOT NULL,
   signal_device_id     INTEGER NOT NULL,
   registered_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-  revoked_at           TIMESTAMPTZ,
-  UNIQUE(user_id)
+  revoked_at           TIMESTAMPTZ
 );
+
+-- Keep revoked devices for audit/identity-change handling while allowing only
+-- one current device for the single-device MVP.
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_device_per_user
+  ON device_identity_keys(user_id) WHERE revoked_at IS NULL;
 
 -- 6. Signed Prekeys Table (v3)
 CREATE TABLE IF NOT EXISTS signed_prekeys (

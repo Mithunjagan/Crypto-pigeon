@@ -14,7 +14,7 @@ function redact(val: any): any {
   if (typeof val === 'object') {
     const next: any = {};
     for (const k of Object.keys(val)) {
-      if (['password', 'passkey', 'token', 'authorization', 'signature', 'ciphertext', 'public_key', 'publicKey', 'identityKey', 'signedPrekey', 'oneTimePrekeys', 'pqOneTimePrekeys'].includes(k.toLowerCase())) {
+      if (['password', 'passkey', 'token', 'authorization', 'signature', 'ciphertext', 'public_key', 'publickey', 'identitykey', 'signedprekey', 'onetimeprekeys', 'pqonetimeprekeys', 'activationcode', 'privatekey', 'private_key', 'pepper', 'database_url', 'databaseurl'].includes(k.toLowerCase())) {
         next[k] = '[REDACTED]';
       } else {
         next[k] = redact(val[k]);

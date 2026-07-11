@@ -2,7 +2,7 @@ import { loggerLevel } from './config.js';
 
 type LogFn = (obj: any, msg?: string) => void;
 
-function redact(val: any): any {
+export function redact(val: any): any {
   if (!val) return val;
   if (typeof val === 'string') {
     // Redact base64 key patterns, hex signatures, authorization tokens, passwords, IPs
@@ -18,7 +18,7 @@ function redact(val: any): any {
   if (typeof val === 'object') {
     const next: any = {};
     for (const k of Object.keys(val)) {
-      if (['password', 'passkey', 'token', 'authorization', 'signature', 'ciphertext', 'public_key', 'publicKey', 'identityKey', 'signedPrekey', 'oneTimePrekeys', 'pqOneTimePrekeys'].includes(k.toLowerCase())) {
+      if (['password', 'passkey', 'token', 'authorization', 'signature', 'ciphertext', 'public_key', 'publickey', 'identitykey', 'signedprekey', 'onetimeprekeys', 'pqonetimeprekeys', 'activationcode', 'privatekey', 'private_key', 'pepper', 'database_url', 'databaseurl'].includes(k.toLowerCase())) {
         next[k] = '[REDACTED]';
       } else {
         next[k] = redact(val[k]);
@@ -46,3 +46,15 @@ export const logger = {
   warn: ((obj, msg) => log('warn', obj, msg)) as LogFn,
   error: ((obj, msg) => log('error', obj, msg)) as LogFn
 };
+
+export function routeErrorDetails(error: unknown, method: string, route: string) {
+  const cause = error instanceof Error ? error : new Error('unknown_error');
+  const safeMessage = cause.message.replace(/postgres(?:ql)?:\/\/[^\s]+/gi, '[REDACTED_DATABASE_URL]');
+  return {
+    errorName: cause.name,
+    safeMessage,
+    stack: process.env.NODE_ENV === 'development' ? cause.stack?.replace(/postgres(?:ql)?:\/\/[^\s]+/gi, '[REDACTED_DATABASE_URL]') : undefined,
+    method,
+    route
+  };
+}

@@ -2,7 +2,7 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { pool } from './db.js';
 import { authMiddleware } from './auth.js';
-import { logger } from './logger.js';
+import { logger, routeErrorDetails } from './logger.js';
 import { base64Schema } from '@crypto-pigeon/protocol';
 
 export function setupAttachmentsRoutes(app: any) {
@@ -24,8 +24,8 @@ export function setupAttachmentsRoutes(app: any) {
       );
       return { ok: true };
     } catch (error) {
-      logger.error({ err: error }, 'Failed to initialize attachment upload');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to initialize attachment upload');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     }
   });
 
@@ -62,8 +62,8 @@ export function setupAttachmentsRoutes(app: any) {
       );
       return { ok: true };
     } catch (error) {
-      logger.error({ err: error }, 'Failed to upload chunk');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to upload chunk');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     }
   });
 
@@ -91,8 +91,8 @@ export function setupAttachmentsRoutes(app: any) {
         ciphertext: Buffer.from(row.ciphertext).toString('base64')
       };
     } catch (error) {
-      logger.error({ err: error }, 'Failed to fetch chunk');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to fetch chunk');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     }
   });
 
@@ -108,8 +108,8 @@ export function setupAttachmentsRoutes(app: any) {
       }
       return reply.code(204).send();
     } catch (error) {
-      logger.error({ err: error }, 'Failed to delete blob');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to delete blob');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     }
   });
 }

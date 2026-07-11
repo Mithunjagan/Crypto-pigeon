@@ -17,6 +17,12 @@ const __dirname = dirname(__filename);
 export async function initDb() {
   const client = await pool.connect();
   try {
+    await client.query('BEGIN');
+    await client.query(`CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+
     // Check if old devices table exists
     const devicesCheck = await client.query(`
       SELECT 1 FROM information_schema.tables 
@@ -38,16 +44,30 @@ export async function initDb() {
       await client.query('DROP INDEX IF EXISTS one_time_prekeys_device_signal_id');
     }
 
-    // Run schema.sql
+    // Run the idempotent base schema before applying compatibility repairs.
     const schemaSqlPath = join(__dirname, 'schema.sql');
     const schemaSql = await readFile(schemaSqlPath, 'utf8');
     await client.query(schemaSql);
 
+    // Earlier development schemas used prekey_id as the primary key.  The
+    // relay now selects prekeys by an opaque generated id, so existing tables
+    // are repaired in place rather than made nullable or silently discarded.
+    await client.query(`ALTER TABLE one_time_prekeys ADD COLUMN IF NOT EXISTS id UUID`);
+    await client.query(`UPDATE one_time_prekeys SET id = gen_random_uuid() WHERE id IS NULL`);
+    await client.query(`ALTER TABLE one_time_prekeys ALTER COLUMN id SET DEFAULT gen_random_uuid()`);
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS one_time_prekeys_generated_id_idx ON one_time_prekeys(id)`);
+
+    // Development schema v3 used UNIQUE(user_id), which made it impossible to
+    // retain a revoked device record during replacement.  Replace it with the
+    // partial unique index defined in schema.sql. This is idempotent and keeps
+    // existing device history intact.
+    await client.query('ALTER TABLE device_identity_keys DROP CONSTRAINT IF EXISTS device_identity_keys_user_id_key');
+    await client.query(`CREATE UNIQUE INDEX IF NOT EXISTS one_active_device_per_user
+      ON device_identity_keys(user_id) WHERE revoked_at IS NULL`);
+
     // If migrating, copy data and drop old tables
     if (oldDevicesExist && !newKeysExist) {
       logger.info('Migrating data from devices table to device_identity_keys');
-      await client.query('BEGIN');
-
       // Migrate devices
       await client.query(`
         INSERT INTO device_identity_keys (
@@ -94,10 +114,13 @@ export async function initDb() {
       }
 
       await client.query('DROP TABLE IF EXISTS devices');
-      await client.query('COMMIT');
       logger.info('Migration from devices completed successfully');
     }
+
+    await client.query('INSERT INTO schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING');
+    await client.query('COMMIT');
   } catch (error) {
+    await client.query('ROLLBACK').catch(() => undefined);
     logger.error({ err: error }, 'Database initialization or migration failed');
     throw error;
   } finally {

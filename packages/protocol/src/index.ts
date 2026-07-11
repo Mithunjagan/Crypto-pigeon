@@ -68,6 +68,10 @@ export const prekeyBundleSchema = z.object({
 export const activationPayloadSchema = z.object({
   requestId: deviceIdSchema,
   activationCode: z.string().min(20).max(256),
+  // The daemon creates this UUID before activation and uses it for every
+  // subsequent challenge-response authentication.  It must therefore be the
+  // same value that is persisted as the relay device_id (not the request ID).
+  deviceId: deviceIdSchema,
   deviceAuthPublicKey: base64Schema,
   signalIdentityPublicKey: base64Schema,
   registrationId: z.number().int().positive(),
@@ -76,6 +80,13 @@ export const activationPayloadSchema = z.object({
   oneTimePrekeys: z.array(oneTimePrekeySchema).min(20).max(200),
   pqOneTimePrekeys: z.array(pqOneTimePrekeySchema).min(20).max(200),
   pqLastResortPrekey: pqOneTimePrekeySchema
+});
+
+export const accessApplyResponseSchema = z.object({
+  requestId: deviceIdSchema,
+  username: usernameSchema,
+  status: z.literal('pending'),
+  expiresAt: z.string().datetime().optional()
 });
 
 // Ed25519 Crypto Helpers

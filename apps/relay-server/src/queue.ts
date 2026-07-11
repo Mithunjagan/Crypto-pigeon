@@ -2,7 +2,7 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { pool } from './db.js';
 import { authMiddleware } from './auth.js';
-import { logger } from './logger.js';
+import { logger, routeErrorDetails } from './logger.js';
 import { envelopeSchema } from '@crypto-pigeon/protocol';
 import { notifyClient } from './ws-handler.js';
 
@@ -88,8 +88,8 @@ export function setupQueueRoutes(app: any) {
       return reply.code(202).send({ envelopeId: body.envelopeId });
     } catch (error) {
       await client.query('ROLLBACK');
-      logger.error({ err: error }, 'Failed to enqueue message');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to enqueue message');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     } finally {
       client.release();
     }
@@ -136,8 +136,8 @@ export function setupQueueRoutes(app: any) {
       );
       return reply.code(204).send();
     } catch (error) {
-      logger.error({ err: error }, 'Failed to acknowledge messages');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to acknowledge messages');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     }
   });
 }

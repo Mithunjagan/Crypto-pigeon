@@ -3,7 +3,7 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { pool } from './db.js';
 import { env, relayHostname as expectedRelayHostname } from './config.js';
-import { logger } from './logger.js';
+import { logger, routeErrorDetails } from './logger.js';
 import {
   deviceIdSchema,
   challengeRequestSchema,
@@ -41,7 +41,11 @@ export const authMiddleware = async (request: FastifyRequest, reply: FastifyRepl
   try {
     const nowMs = Date.now();
     const result = await pool.query(
-      'SELECT device_id FROM sessions WHERE token = $1 AND expires_at > $2',
+      `SELECT s.device_id
+       FROM sessions s
+       JOIN device_identity_keys d ON d.device_id = s.device_id
+       JOIN users u ON u.user_id = d.user_id
+       WHERE s.token = $1 AND s.expires_at > $2 AND d.revoked_at IS NULL AND u.revoked_at IS NULL`,
       [token, nowMs]
     );
 
@@ -53,8 +57,8 @@ export const authMiddleware = async (request: FastifyRequest, reply: FastifyRepl
       deviceId: result.rows[0].device_id
     };
   } catch (error) {
-    logger.error({ err: error }, 'Token verification failed');
-    return reply.code(500).send({ error: 'internal_error' });
+    logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Token verification failed');
+    return reply.code(500).send({ error: 'INTERNAL_ERROR' });
   }
 };
 
@@ -83,7 +87,7 @@ export function setupAuthRoutes(app: any) {
     // Verify that device exists in DB before generating challenge
     const devCheck = await pool.query('SELECT 1 FROM device_identity_keys WHERE device_id = $1 AND revoked_at IS NULL', [deviceId]);
     if (devCheck.rows.length === 0) {
-      return reply.code(401).send({ error: 'device_not_registered' });
+      return reply.code(409).send({ error: 'DEVICE_NOT_REGISTERED' });
     }
 
     const challenge = crypto.randomBytes(32).toString('hex');
@@ -153,33 +157,52 @@ export function setupAuthRoutes(app: any) {
   // POST /api/access/apply
   app.post('/api/access/apply', async (request: FastifyRequest, reply: FastifyReply) => {
     const { username } = z.object({ username: usernameSchema }).parse(request.body);
-    const requestId = crypto.randomUUID();
 
     try {
-      const existing = await pool.query(
-        'SELECT 1 FROM users WHERE username=$1 UNION ALL SELECT 1 FROM access_requests WHERE username=$1 LIMIT 1',
+      const existingRequest = await pool.query(
+        `SELECT request_id, username, status, activation_expires_at
+         FROM access_requests WHERE username=$1`,
         [username]
       );
-
-      if (existing.rows.length > 0) {
-        return reply.code(202).send({ request_id: requestId, status: 'received' });
+      if (existingRequest.rows[0]) {
+        const row = existingRequest.rows[0];
+        if (row.status === 'pending') {
+          return reply.code(202).send({
+            requestId: row.request_id,
+            username: row.username,
+            status: 'pending',
+            expiresAt: row.activation_expires_at?.toISOString?.()
+          });
+        }
+        return reply.code(409).send({ error: 'USERNAME_UNAVAILABLE' });
       }
+
+      const existingUser = await pool.query('SELECT 1 FROM users WHERE username=$1', [username]);
+      if (existingUser.rows[0]) return reply.code(409).send({ error: 'USERNAME_UNAVAILABLE' });
+
+      const requestId = crypto.randomUUID();
 
       await pool.query(
         'INSERT INTO access_requests (request_id, username, status) VALUES ($1, $2, \'pending\')',
         [requestId, username]
       );
-    } catch {
-      // Return 202 to avoid enumerability of requests
-      return reply.code(202).send({ request_id: requestId, status: 'received' });
+      return reply.code(202).send({ requestId, username, status: 'pending' });
+    } catch (error) {
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Access application failed');
+      return reply.code(503).send({ error: 'RELAY_UNAVAILABLE' });
     }
-
-    return reply.code(202).send({ request_id: requestId, status: 'received' });
   });
 
   // POST /api/access/activate
   app.post('/api/access/activate', async (request: FastifyRequest, reply: FastifyReply) => {
-    const payload = activationPayloadSchema.parse(request.body);
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    if (typeof body.requestId !== 'string' || body.requestId.trim() === '') {
+      return reply.code(400).send({ error: 'REQUEST_ID_REQUIRED' });
+    }
+    if (typeof body.activationCode !== 'string' || body.activationCode.trim() === '') {
+      return reply.code(400).send({ error: 'ACTIVATION_CODE_REQUIRED' });
+    }
+    const payload = activationPayloadSchema.parse(body);
     const client = await pool.connect();
 
     try {
@@ -193,25 +216,54 @@ export function setupAuthRoutes(app: any) {
         [payload.requestId]
       );
 
-      const requestRow = appQuery.rows[0];
+      const requestRow = appQuery.rows[0] as {
+        username: string; status: string; activation_code_hash: string | null;
+        attempt_count: number; activation_expires_at: Date | null;
+      } | undefined;
       if (!requestRow) {
         await client.query('ROLLBACK');
-        return reply.code(401).send({ error: 'activation_failed' });
+        return reply.code(404).send({ error: 'REQUEST_NOT_FOUND' });
+      }
+
+      const computedHash = computeHmac(payload.activationCode, env.ACTIVATION_PEPPER);
+      const isMatch = !!requestRow.activation_code_hash && timingSafeCompare(requestRow.activation_code_hash, computedHash);
+
+      // The relay may have committed successfully while the local vault failed
+      // to persist.  A retry with the same device key and code returns the
+      // existing account instead of creating a second device.
+      if (requestRow.status === 'activated') {
+        const existing = await client.query(
+          `SELECT u.user_id, d.device_id, u.username, d.identity_public_key, d.auth_public_key
+           FROM users u JOIN device_identity_keys d ON d.user_id=u.user_id
+           WHERE u.username=$1 AND d.device_id=$2 AND d.revoked_at IS NULL`,
+          [requestRow.username, payload.deviceId]
+        );
+        await client.query('ROLLBACK');
+        const device = existing.rows[0];
+        const identityMatches = device && Buffer.from(device.identity_public_key).equals(Buffer.from(payload.signalIdentityPublicKey, 'base64'));
+        const authMatches = device && Buffer.from(device.auth_public_key).equals(Buffer.from(payload.deviceAuthPublicKey, 'base64'));
+        if (!isMatch || !identityMatches || !authMatches) {
+          return reply.code(409).send({ error: 'ACTIVATION_ALREADY_COMPLETED' });
+        }
+        const sessionToken = crypto.randomBytes(32).toString('base64url');
+        const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
+        await pool.query('INSERT INTO sessions (token, device_id, expires_at) VALUES ($1, $2, $3)', [sessionToken, device.device_id, expiresAt]);
+        return reply.code(200).send({ sessionToken, expiresAt, userId: device.user_id, deviceId: device.device_id, username: device.username });
       }
 
       if (requestRow.status !== 'approved') {
         await client.query('ROLLBACK');
-        return reply.code(401).send({ error: 'activation_failed' });
+        return reply.code(409).send({ error: 'REQUEST_NOT_APPROVED' });
       }
 
-      if (new Date() > new Date(requestRow.activation_expires_at)) {
+      if (!requestRow.activation_expires_at || Date.now() > requestRow.activation_expires_at.getTime()) {
         await client.query('ROLLBACK');
-        return reply.code(401).send({ error: 'activation_failed' });
+        return reply.code(410).send({ error: 'ACTIVATION_CODE_EXPIRED' });
       }
 
       if (requestRow.attempt_count >= 5) {
         await client.query('ROLLBACK');
-        return reply.code(401).send({ error: 'activation_failed' });
+        return reply.code(429).send({ error: 'ACTIVATION_ATTEMPTS_EXCEEDED' });
       }
 
       // Increment attempt count
@@ -220,16 +272,15 @@ export function setupAuthRoutes(app: any) {
         [payload.requestId]
       );
 
-      const computedHash = computeHmac(payload.activationCode, env.ACTIVATION_PEPPER);
-      const isMatch = timingSafeCompare(requestRow.activation_code_hash, computedHash);
-
       if (!isMatch) {
         await client.query('COMMIT'); // Commit incremented attempt count
-        return reply.code(401).send({ error: 'activation_failed' });
+        return reply.code(401).send({ error: 'ACTIVATION_CODE_INVALID' });
       }
 
       const userId = crypto.randomUUID();
-      const deviceId = payload.requestId; // Bind requestId directly to device_id
+      const deviceId = payload.deviceId;
+      const sessionToken = crypto.randomBytes(32).toString('base64url');
+      const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
 
       // 1. Create User
       await client.query(
@@ -300,22 +351,18 @@ export function setupAuthRoutes(app: any) {
         [payload.requestId]
       );
 
-      await client.query('COMMIT');
-
-      // Generate session token to log them in immediately
-      const sessionToken = crypto.randomBytes(32).toString('base64url');
-      const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
-
-      await pool.query(
+      await client.query(
         'INSERT INTO sessions (token, device_id, expires_at) VALUES ($1, $2, $3)',
         [sessionToken, deviceId, expiresAt]
       );
 
-      return reply.code(201).send({ sessionToken, expiresAt, userId });
+      await client.query('COMMIT');
+
+      return reply.code(201).send({ sessionToken, expiresAt, userId, deviceId, username: requestRow.username });
     } catch (error) {
-      await client.query('ROLLBACK');
-      logger.error({ err: error }, 'Activation failed');
-      return reply.code(500).send({ error: 'internal_error' });
+      await client.query('ROLLBACK').catch(() => undefined);
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Activation failed');
+      return reply.code(500).send({ error: 'PREKEY_REGISTRATION_FAILED' });
     } finally {
       client.release();
     }

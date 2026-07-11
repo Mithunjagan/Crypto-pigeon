@@ -1,8 +1,8 @@
 import type { FastifyRequest, FastifyReply } from 'fastify';
 import { z } from 'zod';
 import { pool } from './db.js';
-import { authMiddleware } from './auth.js';
-import { logger } from './logger.js';
+import { authMiddleware, adminAuthMiddleware } from './auth.js';
+import { logger, routeErrorDetails } from './logger.js';
 import { env } from './config.js';
 import {
   signedPrekeySchema,
@@ -46,8 +46,8 @@ export function setupPrekeysRoutes(app: any) {
       return { ok: true };
     } catch (error) {
       await client.query('ROLLBACK');
-      logger.error({ err: error }, 'Failed to upload signed prekey');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to upload signed prekey');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     } finally {
       client.release();
     }
@@ -75,8 +75,8 @@ export function setupPrekeysRoutes(app: any) {
       return { ok: true };
     } catch (error) {
       await client.query('ROLLBACK');
-      logger.error({ err: error }, 'Failed to upload one-time prekeys');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to upload one-time prekeys');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     } finally {
       client.release();
     }
@@ -113,8 +113,8 @@ export function setupPrekeysRoutes(app: any) {
       return { ok: true };
     } catch (error) {
       await client.query('ROLLBACK');
-      logger.error({ err: error }, 'Failed to upload PQ prekeys');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to upload PQ prekeys');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     } finally {
       client.release();
     }
@@ -197,7 +197,7 @@ export function setupPrekeysRoutes(app: any) {
 
       // 2. Fetch device identity details
       const deviceRes = await client.query(
-        `SELECT d.identity_public_key, d.registration_id, d.signal_device_id, u.username
+        `SELECT d.user_id, d.identity_public_key, d.registration_id, d.signal_device_id, u.username
          FROM device_identity_keys d
          JOIN users u ON u.user_id = d.user_id
          WHERE d.device_id = $1 AND d.revoked_at IS NULL`,
@@ -301,7 +301,7 @@ export function setupPrekeysRoutes(app: any) {
       }
 
       return {
-        recipientUserId: u2,
+        recipientUserId: deviceRow.user_id,
         recipientDeviceId: targetDeviceId,
         recipientUsername: deviceRow.username,
         identityKey: Buffer.from(deviceRow.identity_public_key).toString('base64'),
@@ -328,25 +328,15 @@ export function setupPrekeysRoutes(app: any) {
       };
     } catch (error) {
       await client.query('ROLLBACK');
-      logger.error({ err: error }, 'Failed to fetch prekey bundle');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to fetch prekey bundle');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     } finally {
       client.release();
     }
   });
 
   // POST /api/prekeys/cleanup
-  app.post('/api/prekeys/cleanup', { preHandler: authMiddleware }, async (request: FastifyRequest, reply: FastifyReply) => {
-    // Only allow admin to clean up expired signed prekeys
-    const authHeader = request.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return reply.code(401).send({ error: 'admin_auth_required' });
-    }
-    const token = authHeader.substring(7);
-    if (token !== env.ADMIN_TOKEN) {
-      return reply.code(401).send({ error: 'admin_auth_required' });
-    }
-
+  app.post('/api/prekeys/cleanup', { preHandler: adminAuthMiddleware }, async (request: FastifyRequest, reply: FastifyReply) => {
     try {
       // Remove signed prekeys older than 30 days, keeping the latest one for each device
       await pool.query(`
@@ -360,8 +350,8 @@ export function setupPrekeysRoutes(app: any) {
       `);
       return { ok: true };
     } catch (error) {
-      logger.error({ err: error }, 'Prekey cleanup failed');
-      return reply.code(500).send({ error: 'internal_error' });
+      logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Prekey cleanup failed');
+      return reply.code(500).send({ error: 'INTERNAL_ERROR' });
     }
   });
 }

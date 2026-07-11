@@ -9,7 +9,7 @@ import { env } from './config.js';
 import { logger } from './logger.js';
 import { Vault } from './vault.js';
 import { LocalSignalStore } from './signal-store.js';
-import { RelayClient } from './relay-client.js';
+import { RelayClient, RelayClientError } from './relay-client.js';
 import { setSecurityHeaders } from './security.js';
 import {
   generateBootstrapSecret,
@@ -59,6 +59,30 @@ function getStore(): LocalSignalStore {
     store = new LocalSignalStore(vault.database());
   }
   return store;
+}
+
+function errorCode(error: unknown): string {
+  return error instanceof RelayClientError ? error.code : 'LOCAL_VAULT_PERSISTENCE_FAILED';
+}
+
+function logRouteError(error: unknown, request: FastifyRequest, message: string) {
+  const cause = error instanceof Error ? error : new Error('unknown_error');
+  logger.error({
+    errorName: cause.name,
+    safeMessage: cause.message,
+    stack: process.env.NODE_ENV === 'development' ? cause.stack : undefined,
+    method: request.method,
+    route: request.routeOptions.url
+  }, message);
+}
+
+function requireRegistered(reply: FastifyReply): LocalSignalStore | null {
+  const activeStore = getStore();
+  if (!activeStore.isRegistered()) {
+    reply.code(409).send({ error: 'DEVICE_NOT_REGISTERED' });
+    return null;
+  }
+  return activeStore;
 }
 
 // Local API Endpoints
@@ -118,17 +142,49 @@ app.post('/api/vault/change-password', async (request: FastifyRequest, reply: Fa
 });
 
 // POST /api/access/apply
-app.post('/api/access/apply', async (request: FastifyRequest) => {
+app.post('/api/access/apply', async (request: FastifyRequest, reply: FastifyReply) => {
   const { username } = z.object({ username: z.string() }).parse(request.body);
-  return relayClient.applyAccess(username);
+  try {
+    const result = await relayClient.applyAccess(username);
+    vault.database().prepare(
+      `INSERT INTO activation_state (singleton, request_id, username, status, expires_at, updated_at)
+       VALUES (1, ?, ?, 'pending', ?, ?)
+       ON CONFLICT(singleton) DO UPDATE SET request_id=excluded.request_id, username=excluded.username,
+         status='pending', expires_at=excluded.expires_at, updated_at=excluded.updated_at`
+    ).run([result.requestId, result.username, result.expiresAt ?? null, Date.now()]);
+    return reply.code(202).send(result);
+  } catch (error) {
+    logRouteError(error, request, 'Access application failed');
+    return reply.code(error instanceof RelayClientError ? error.status : 503).send({ error: errorCode(error) });
+  }
+});
+
+app.get('/api/access/state', async () => {
+  const value = vault.database().prepare(
+    'SELECT request_id, username, status, expires_at FROM activation_state WHERE singleton=1'
+  ).get<{ request_id: string; username: string; status: 'pending' | 'activated'; expires_at: string | null }>();
+  if (!value) return { status: 'idle' as const };
+  return {
+    requestId: value.request_id,
+    username: value.username,
+    status: value.status,
+    expiresAt: value.expires_at ?? undefined
+  };
 });
 
 // POST /api/access/activate
 app.post('/api/access/activate', async (request: FastifyRequest, reply: FastifyReply) => {
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  if (typeof body.requestId !== 'string' || body.requestId.trim() === '') {
+    return reply.code(400).send({ error: 'REQUEST_ID_REQUIRED' });
+  }
+  if (typeof body.activationCode !== 'string' || body.activationCode.trim() === '') {
+    return reply.code(400).send({ error: 'ACTIVATION_CODE_REQUIRED' });
+  }
   const { requestId, activationCode } = z.object({
     requestId: z.string().uuid(),
-    activationCode: z.string()
-  }).parse(request.body);
+    activationCode: z.string().min(20).max(256)
+  }).parse(body);
 
   if (vault.isLocked()) {
     return reply.code(400).send({ error: 'vault_locked' });
@@ -143,6 +199,7 @@ app.post('/api/access/activate', async (request: FastifyRequest, reply: FastifyR
     const activateRes = await relayClient.activateAccess({
       requestId,
       activationCode,
+      deviceId: bundle.deviceId,
       deviceAuthPublicKey: bundle.deviceAuthPublicKey,
       signalIdentityPublicKey: bundle.identityPublicKey,
       registrationId: bundle.registrationId,
@@ -153,20 +210,30 @@ app.post('/api/access/activate', async (request: FastifyRequest, reply: FastifyR
       pqLastResortPrekey: bundle.pqLastResortPrekey
     });
 
-    // Save user_id to local store
-    activeStore.setAccount(activateRes.userId);
+    // Account id, device id, token, and registration state are committed in
+    // one local-vault transaction. Retrying the same activation is idempotent.
+    activeStore.completeRegistration({
+      userId: activateRes.userId,
+      deviceId: activateRes.deviceId,
+      username: activateRes.username,
+      sessionToken: activateRes.sessionToken
+    });
 
-    return { ok: true };
-  } catch (error: any) {
-    logger.error({ err: error }, 'Activation failed');
-    return reply.code(400).send({ error: error.message || 'activation_failed' });
+    return { ok: true, deviceId: activateRes.deviceId };
+  } catch (error) {
+    logRouteError(error, request, 'Activation failed');
+    return reply.code(error instanceof RelayClientError ? error.status : 500).send({ error: errorCode(error) });
   }
 });
 
 // GET /api/contacts
 app.get('/api/contacts', async () => {
   const db = vault.database();
-  const contacts = db.prepare('SELECT contact_id, username, verified, identity_changed FROM contacts ORDER BY username').all();
+  const contacts = db.prepare(
+    `SELECT c.contact_id, c.username, c.verified, c.identity_changed, conv.conversation_id
+     FROM contacts c JOIN conversations conv ON conv.contact_id = c.contact_id
+     ORDER BY c.username`
+  ).all();
   return contacts;
 });
 
@@ -175,6 +242,33 @@ app.post('/api/contacts/add', async (request: FastifyRequest) => {
   const { username } = z.object({ username: z.string() }).parse(request.body);
   const activeStore = getStore();
   return addContactAndSession(vault, activeStore, relayClient, username);
+});
+
+// Conversation authorization is recipient-controlled.  A contact prekey
+// bundle cannot be fetched until the recipient has accepted this request.
+app.post('/api/conversations/requests', async (request: FastifyRequest, reply: FastifyReply) => {
+  const { recipientUsername } = z.object({ recipientUsername: z.string().trim().toLowerCase() }).parse(request.body);
+  const activeStore = requireRegistered(reply);
+  if (!activeStore) return;
+  const res = await relayClient.request(vault, activeStore, '/api/conversations/requests', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ recipientUsername })
+  });
+  return reply.code(res.status).send(await res.json());
+});
+
+app.get('/api/conversations/requests', async (request: FastifyRequest, reply: FastifyReply) => {
+  const activeStore = requireRegistered(reply);
+  if (!activeStore) return;
+  const res = await relayClient.request(vault, activeStore, '/api/conversations/requests');
+  return reply.code(res.status).send(await res.json());
+});
+
+app.post('/api/conversations/requests/:requestId/:decision', async (request: FastifyRequest, reply: FastifyReply) => {
+  const params = z.object({ requestId: z.string().uuid(), decision: z.enum(['accept', 'reject']) }).parse(request.params);
+  const activeStore = requireRegistered(reply);
+  if (!activeStore) return;
+  const res = await relayClient.request(vault, activeStore, `/api/conversations/requests/${params.requestId}/${params.decision}`, { method: 'POST' });
+  return reply.code(res.status).send(await res.json());
 });
 
 // POST /api/send
@@ -205,10 +299,19 @@ app.get('/api/messages/:conversationId', async (request: FastifyRequest) => {
 });
 
 // POST /api/fetch-messages
-app.post('/api/fetch-messages', async () => {
-  const activeStore = getStore();
+app.post('/api/fetch-messages', async (_request: FastifyRequest, reply: FastifyReply) => {
+  const activeStore = requireRegistered(reply);
+  if (!activeStore) return;
   const count = await syncMessages(vault, activeStore, relayClient);
   return { received: count };
+});
+
+app.setErrorHandler((error, request, reply) => {
+  logRouteError(error, request, 'Unhandled local-daemon error');
+  if (error instanceof z.ZodError) {
+    return reply.code(400).send({ error: 'INVALID_REQUEST' });
+  }
+  return reply.code(500).send({ error: 'INTERNAL_ERROR' });
 });
 
 // POST /api/attachments/encrypt

@@ -11,7 +11,13 @@
     "admin": "npm run start --workspace=@crypto-pigeon/admin-cli --",
     "build": "npm run build --workspaces",
     "test": "npm run test --workspaces --if-present",
-    "typecheck": "npm run build --workspaces"
+    "test:unit": "npm run test --workspace=@crypto-pigeon/tests",
+    "typecheck": "npm run build --workspaces",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:reset-dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/reset-dev.ps1",
+    "verify": "npm run build && npm run test && git diff --check"
   },
   "engines": { "node": ">=22" }
 }

@@ -31,6 +31,7 @@ export default function App() {
   const [messages, setMessages] = useState<any[]>([]);
   const [inputText, setInputText] = useState('');
   const [newContactUsername, setNewContactUsername] = useState('');
+  const [incomingRequests, setIncomingRequests] = useState<any[]>([]);
   
   // UI Panels
   const [showSettings, setShowSettings] = useState(false);
@@ -54,6 +55,7 @@ export default function App() {
 
   // Poll intervals
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const pollFailuresRef = useRef(0);
 
   useEffect(() => {
     bootstrapSession();
@@ -62,16 +64,40 @@ export default function App() {
   useEffect(() => {
     if (vaultState === 'unlocked') {
       loadContacts();
-      const interval = setInterval(() => {
-        syncMessages();
-      }, 3000);
-      return () => clearInterval(interval);
+      loadRegistrationState();
     }
   }, [vaultState, csrfToken]);
 
   useEffect(() => {
+    if (vaultState !== 'unlocked' || registrationState !== 'success') return;
+    let stopped = false;
+    let timer: number | undefined;
+
+    const poll = async () => {
+      const results = await Promise.all([syncMessages(), loadConversationRequests()]);
+      if (stopped) return;
+      const registrationError = results.some(result => result.status === 401 || result.status === 409);
+      if (registrationError) {
+        setErrorMsg('Device is not registered with the relay. Polling has stopped.');
+        return;
+      }
+      const failed = results.some(result => !result.ok);
+      pollFailuresRef.current = failed ? pollFailuresRef.current + 1 : 0;
+      const delay = Math.min(3000 * 2 ** pollFailuresRef.current, 30000);
+      timer = window.setTimeout(poll, delay);
+    };
+
+    pollFailuresRef.current = 0;
+    void poll();
+    return () => {
+      stopped = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [vaultState, csrfToken, registrationState, selectedContact]);
+
+  useEffect(() => {
     if (selectedContact) {
-      loadMessages(selectedContact.contact_id);
+      loadMessages(selectedContact.conversation_id);
     }
   }, [selectedContact]);
 
@@ -117,6 +143,49 @@ export default function App() {
     }
     options.headers = headers;
     return fetch(path, options);
+  };
+
+  const errorMessage = (code?: string) => ({
+    REQUEST_ID_REQUIRED: 'Missing request ID',
+    REQUEST_ID_INVALID: 'Missing request ID',
+    ACTIVATION_CODE_REQUIRED: 'Activation code is required',
+    ACTIVATION_CODE_EXPIRED: 'Activation code expired',
+    ACTIVATION_CODE_INVALID: 'Activation code invalid',
+    ACTIVATION_ATTEMPTS_EXCEEDED: 'Too many invalid activation attempts',
+    REQUEST_NOT_APPROVED: 'Request not approved',
+    REQUEST_NOT_FOUND: 'Activation request not found',
+    ACTIVATION_ALREADY_COMPLETED: 'This activation request has already been completed',
+    PREKEY_REGISTRATION_FAILED: 'Prekey registration failed',
+    LOCAL_VAULT_PERSISTENCE_FAILED: 'Local vault persistence failed',
+    RELAY_UNAVAILABLE: 'Relay unavailable',
+    DEVICE_NOT_REGISTERED: 'Device is not registered with the relay',
+    USERNAME_UNAVAILABLE: 'Username is unavailable'
+  }[code || ''] || code || 'Request failed');
+
+  const responseError = async (res: Response, fallback: string) => {
+    try {
+      const body = await res.json() as { error?: string };
+      return errorMessage(body.error) || fallback;
+    } catch {
+      return fallback;
+    }
+  };
+
+  const loadRegistrationState = async () => {
+    try {
+      const res = await apiFetch('/api/access/state');
+      if (!res.ok) return;
+      const data = await res.json() as { requestId?: string; username?: string; status?: 'idle' | 'pending' | 'activated' };
+      if (data.status === 'pending' && data.requestId) {
+        setRequestId(data.requestId);
+        setRegUsername(data.username || '');
+        setRegistrationState('pending');
+      } else if (data.status === 'activated') {
+        setRegistrationState('success');
+      }
+    } catch {
+      // The page remains usable; retry happens on the next unlock/session refresh.
+    }
   };
 
   const handleCreateVault = async (e: React.FormEvent) => {
@@ -208,12 +277,16 @@ export default function App() {
       });
       if (res.ok) {
         const data = await res.json();
+        if (!data.requestId) {
+          setErrorMsg('Relay did not return an activation request ID');
+          return;
+        }
         setRequestId(data.requestId);
+        setRegUsername(data.username || regUsername);
         setRegistrationState('pending');
         setErrorMsg(null);
       } else {
-        const data = await res.json();
-        setErrorMsg(data.error || 'Failed to apply');
+        setErrorMsg(await responseError(res, 'Relay unavailable'));
       }
     } catch {
       setErrorMsg('Network error');
@@ -222,6 +295,14 @@ export default function App() {
 
   const handleActivateAccess = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!requestId) {
+      setErrorMsg('Missing request ID');
+      return;
+    }
+    if (!activationCode.trim()) {
+      setErrorMsg('Activation code is required');
+      return;
+    }
     try {
       const res = await apiFetch('/api/access/activate', {
         method: 'POST',
@@ -232,8 +313,7 @@ export default function App() {
         setActivationCode('');
         setErrorMsg(null);
       } else {
-        const data = await res.json();
-        setErrorMsg(data.error || 'Activation failed');
+        setErrorMsg(await responseError(res, 'Activation failed'));
       }
     } catch {
       setErrorMsg('Network error');
@@ -273,6 +353,44 @@ export default function App() {
     }
   };
 
+  const handleConversationRequest = async () => {
+    try {
+      const res = await apiFetch('/api/conversations/requests', {
+        method: 'POST', body: JSON.stringify({ recipientUsername: newContactUsername })
+      });
+      if (!res.ok) throw new Error((await res.json()).error || 'request_failed');
+      setInfoMsg('Conversation request sent. The recipient must accept before you establish a session.');
+      setShowAddContact(false);
+      setNewContactUsername('');
+    } catch (error: any) {
+      setErrorMsg(error.message || 'Failed to send conversation request');
+    }
+  };
+
+  const loadConversationRequests = async (): Promise<{ ok: boolean; status?: number }> => {
+    try {
+      const res = await apiFetch('/api/conversations/requests');
+      if (res.ok) {
+        setIncomingRequests(await res.json());
+        return { ok: true, status: res.status };
+      }
+      return { ok: false, status: res.status };
+    } catch {
+      return { ok: false };
+    }
+  };
+
+  const decideConversationRequest = async (requestId: string, decision: 'accept' | 'reject') => {
+    try {
+      const res = await apiFetch(`/api/conversations/requests/${requestId}/${decision}`, { method: 'POST' });
+      if (!res.ok) throw new Error((await res.json()).error || 'decision_failed');
+      await loadConversationRequests();
+      setInfoMsg(`Conversation request ${decision}ed.`);
+    } catch (error: any) {
+      setErrorMsg(error.message || 'Failed to update conversation request');
+    }
+  };
+
   const loadMessages = async (contactId: string) => {
     try {
       const res = await apiFetch(`/api/messages/${contactId}`);
@@ -285,17 +403,19 @@ export default function App() {
     }
   };
 
-  const syncMessages = async () => {
+  const syncMessages = async (): Promise<{ ok: boolean; status?: number }> => {
     try {
       const res = await apiFetch('/api/fetch-messages', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         if (data.received > 0 && selectedContact) {
-          loadMessages(selectedContact.contact_id);
+          loadMessages(selectedContact.conversation_id);
         }
+        return { ok: true, status: res.status };
       }
+      return { ok: false, status: res.status };
     } catch {
-      // ignore
+      return { ok: false };
     }
   };
 
@@ -307,13 +427,13 @@ export default function App() {
       const res = await apiFetch('/api/send', {
         method: 'POST',
         body: JSON.stringify({
-          conversationId: selectedContact.contact_id,
+          conversationId: selectedContact.conversation_id,
           plaintext: inputText
         })
       });
       if (res.ok) {
         setInputText('');
-        loadMessages(selectedContact.contact_id);
+        loadMessages(selectedContact.conversation_id);
       } else {
         const data = await res.json();
         setErrorMsg(data.error || 'Failed to send message');
@@ -355,14 +475,14 @@ export default function App() {
         await apiFetch('/api/send', {
           method: 'POST',
           body: JSON.stringify({
-            conversationId: selectedContact.contact_id,
+            conversationId: selectedContact.conversation_id,
             plaintext: `Sent an attachment: ${file.name}`,
             attachmentManifest: manifest
           })
         });
 
         setInfoMsg(null);
-        loadMessages(selectedContact.contact_id);
+          loadMessages(selectedContact.conversation_id);
       } catch (err) {
         setErrorMsg('Failed to upload attachment');
         setInfoMsg(null);
@@ -409,14 +529,14 @@ export default function App() {
             await apiFetch('/api/send', {
               method: 'POST',
               body: JSON.stringify({
-                conversationId: selectedContact.contact_id,
+          conversationId: selectedContact.conversation_id,
                 plaintext: '🎤 Voice Note',
                 attachmentManifest: manifest
               })
             });
 
             setInfoMsg(null);
-            loadMessages(selectedContact.contact_id);
+        loadMessages(selectedContact.conversation_id);
           } catch {
             setErrorMsg('Failed to upload voice note');
             setInfoMsg(null);
@@ -557,6 +677,20 @@ export default function App() {
 
             {/* Contacts list */}
             <div className="flex-1 overflow-y-auto px-2">
+              {incomingRequests.length > 0 && (
+                <div className="mb-3 px-3 py-2 rounded-lg border border-indigo-500/20 bg-indigo-500/5">
+                  <h3 className="text-xs font-semibold text-indigo-300 uppercase tracking-wider mb-2">Incoming requests</h3>
+                  {incomingRequests.map(item => (
+                    <div key={item.request_id} className="text-xs text-slate-300 mb-2">
+                      <span>{item.requester_username}</span>
+                      <div className="flex gap-2 mt-1">
+                        <button onClick={() => decideConversationRequest(item.request_id, 'accept')} className="text-emerald-400 hover:text-emerald-300">Accept</button>
+                        <button onClick={() => decideConversationRequest(item.request_id, 'reject')} className="text-red-400 hover:text-red-300">Reject</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
               <h3 className="px-3 py-2 text-xs font-semibold text-slate-500 uppercase tracking-wider">Conversations</h3>
               <div className="flex flex-col gap-1">
                 {contacts.length === 0 ? (
@@ -737,7 +871,11 @@ export default function App() {
 
               {registrationState === 'pending' && (
                 <form onSubmit={handleActivateAccess} className="flex flex-col gap-3">
-                  <p className="text-xs text-amber-400">Request ID: {requestId}</p>
+                  {requestId ? (
+                    <p className="text-xs text-amber-400">Request ID: {requestId}</p>
+                  ) : (
+                    <p className="text-xs text-red-400">Activation request is missing its ID. Submit a new request.</p>
+                  )}
                   <input
                     type="text"
                     placeholder="Enter Activation Code"
@@ -775,7 +913,7 @@ export default function App() {
 
             <form onSubmit={handleAddContact} className="flex flex-col gap-4">
               <p className="text-xs text-slate-400">
-                Enter the exact username of the remote contact. The local daemon will fetch their prekey bundle from the relay server and establish a Signal cryptographic session.
+                Send a request first. After the recipient accepts, use Establish Session to fetch their public prekey bundle locally.
               </p>
               <input
                 type="text"
@@ -786,6 +924,9 @@ export default function App() {
               />
               <button type="submit" className="btn-primary py-2.5 text-sm mt-2">
                 Establish Session
+              </button>
+              <button type="button" onClick={handleConversationRequest} className="btn-secondary py-2.5 text-sm">
+                Send Conversation Request
               </button>
             </form>
 

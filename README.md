@@ -140,12 +140,12 @@ node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'
 | Variable | Required | Used by | Meaning |
 |---|---:|---|---|
 | `POSTGRES_PASSWORD` | Yes | Docker Compose | Password for the `crypto_pigeon` PostgreSQL role |
+| `DATABASE_URL` | Admin CLI/local relay only | Admin CLI / direct relay | PostgreSQL connection URL; its password component must be URL percent-encoded |
 | `ADMIN_USERNAME` | Yes | Relay | Admin dashboard username |
 | `ADMIN_TOKEN` | Yes, 32+ chars | Relay | Admin dashboard/API credential; use a high-entropy secret |
 | `ACTIVATION_PEPPER` | Yes, 32+ chars | Relay and admin CLI | Secret HMAC key for activation-code verification; must be identical in both environments |
 | `RELAY_URL` | Client only | Local daemon | Client-visible relay base URL; default `http://127.0.0.1:8443` |
 | `CRYPTO_PIGEON_HOME` | No | Local daemon | Absolute vault directory; defaults to the user's `.crypto_pigeon` directory |
-| `DATABASE_URL` | Admin CLI/manual relay only | Admin CLI / relay | PostgreSQL URL. Docker Compose supplies it to the relay automatically. |
 | `RELAY_HOSTNAME` | Production recommended | Relay | Exact `host:port` included in device challenge signatures. Default is `HOST:PORT`. |
 | `HOST` | No | Relay | Bind address; default `127.0.0.1` |
 | `PORT` | No | Relay/local daemon | Relay port (default `8443`) or daemon port (`0` means random) |
@@ -162,7 +162,7 @@ RELAY_URL=http://127.0.0.1:8443
 # CRYPTO_PIGEON_HOME=C:\Users\you\.crypto_pigeon
 ```
 
-`docker-compose.yml` passes `RELAY_HOSTNAME=127.0.0.1:8443` to the container. For a public relay, use the externally visible hostname and terminate TLS before exposing it.
+`docker-compose.yml` passes `RELAY_HOSTNAME=127.0.0.1:8443` to the container and safely constructs its internal `DATABASE_URL` by percent-encoding `POSTGRES_PASSWORD`. For a locally run relay or the admin CLI, provide `DATABASE_URL` yourself; percent-encode its password component. For a public relay, use the externally visible hostname and terminate TLS before exposing it.
 
 ## Install, build, and run
 
@@ -184,7 +184,7 @@ docker compose up --build -d
 docker compose ps
 ```
 
-The relay is available at `http://127.0.0.1:8443`; its health check is `GET /healthz`.
+The relay is available at `http://127.0.0.1:8443`; `GET /healthz` reports process liveness and `GET /readyz` reports database/migration readiness.
 
 To use a locally running relay instead, start only PostgreSQL, then export the relay variables and run it:
 
@@ -223,14 +223,14 @@ npm.cmd run dev:daemon
 docker compose down
 ```
 
-`docker compose down -v` also deletes the PostgreSQL volume and all relay state. Use it only when intentionally resetting local development data.
+`npm.cmd run docker:reset-dev` asks you to type `DELETE RELAY DATA` before it deletes the PostgreSQL volume and all relay state. Do not use it casually: changing `POSTGRES_PASSWORD` in `.env` does not update an already-initialized PostgreSQL volume, and deleting the relay database can invalidate old vault relay IDs. Use fresh test vault directories after a reset.
 
 ## User and administrator workflow
 
 ### Account activation
 
 1. In the local UI, create/unlock a vault and submit a username access request.
-2. On the trusted administrator workstation, export both `DATABASE_URL` and the **same** `ACTIVATION_PEPPER` used by the relay.
+2. On the trusted administrator workstation, set both `DATABASE_URL` and the **same** `ACTIVATION_PEPPER` used by the relay. The CLI automatically loads the root `.env` when invoked through the workspace scripts, so manual PowerShell exports are normally unnecessary.
 3. List requests and approve the target request. The CLI prints the one-time code once; give it to the user through an appropriate secure channel.
 4. The user enters the request ID and activation code in the local UI. The daemon generates local keys, uploads only public identity/prekey/device-auth material, and stores the relay account ID in its vault.
 
@@ -250,10 +250,11 @@ Activation codes are random 128-bit values, expire after 10 minutes, become inva
 ### Conversation and message workflow
 
 1. Add a contact by exact username in the local UI.
-2. The relay must authorize the conversation pair before a prekey bundle can be used.
-3. Check and compare the displayed safety number out-of-band before treating a contact as verified.
-4. Send text, attachments, or voice-note data. The daemon encrypts before any relay request.
-5. Use **Fetch messages** / normal UI synchronization on the recipient. The recipient vault commits before relay acknowledgement.
+2. Alice sends a conversation request. Bob sees the pending request and accepts or rejects it.
+3. Only after Bob accepts may Alice fetch Bob's prekey bundle or deliver relay envelopes. Rejecting or revoking the pair prevents future bundle access and delivery.
+4. Check and compare the displayed safety number out-of-band before treating a contact as verified.
+5. Send text, attachments, or voice-note data. The daemon encrypts before any relay request.
+6. Use **Fetch messages** / normal UI synchronization on the recipient. The recipient vault commits before relay acknowledgement.
 
 ## API and storage map
 
@@ -284,6 +285,7 @@ The local API is intentionally local-only and is not a public integration API. I
 | `/api/attachments/*` | Encrypted blob metadata/chunk upload, fetch, and deletion |
 | `/api/admin/*`, `/admin` | Admin dashboard routes |
 | `/healthz` | Relay liveness response |
+| `/readyz` | Relay database and migration readiness response |
 
 ### Data placement
 
@@ -309,6 +311,10 @@ npm.cmd run dev:relay   # Run relay with tsx watch
 npm.cmd run dev:daemon  # Run local daemon with tsx watch
 npm.cmd run dev:ui      # Run Vite UI separately (development only)
 npm.cmd run admin -- requests
+npm.cmd run docker:build
+npm.cmd run docker:up
+npm.cmd run docker:down
+npm.cmd run docker:reset-dev  # prompts before deleting relay data
 ```
 
 The daemon serves the production UI from `apps/local-ui/dist`, so run `npm.cmd run build` before using `dev:daemon` if the UI has changed.
@@ -350,7 +356,7 @@ For a manual canary check, send a unique plaintext string through an activated c
 
 ## License
 
-Crypto Pigeon is intended to be distributed under **AGPL-3.0**. Network users must be offered the corresponding source for modified AGPL-covered components. Add and maintain a repository `LICENSE` file before distributing the project.
+No distribution license file is currently included in this repository. Do not describe or distribute this project as AGPL-3.0 (or under any other license) until an authoritative `LICENSE` file is added. If AGPL-3.0 is chosen, network users must be offered corresponding source for covered modifications.
 
 ## Further documentation
 

@@ -171,6 +171,34 @@ export class LocalSignalStore extends SessionStore implements IdentityKeyStore, 
     this.db.prepare('UPDATE signal_account SET user_id=? WHERE singleton=1').run([userId]);
   }
 
+  isRegistered(): boolean {
+    return !!row<{ user_id: string }>(
+      this.db,
+      'SELECT user_id FROM signal_account WHERE singleton=1 AND user_id IS NOT NULL'
+    );
+  }
+
+  completeRegistration(input: { userId: string; deviceId: string; username: string; sessionToken: string }) {
+    const account = this.account();
+    if (account.device_id !== input.deviceId) {
+      throw new Error('local_device_id_mismatch');
+    }
+
+    // Local account id, relay session, and activation status advance together.
+    // If this transaction fails, retrying activation is safe at the relay.
+    this.db.transaction(() => {
+      this.db.prepare('UPDATE signal_account SET user_id=? WHERE singleton=1').run([input.userId]);
+      this.db.prepare(
+        'INSERT INTO relay_auth (singleton, access_token) VALUES (1, ?) ON CONFLICT(singleton) DO UPDATE SET access_token=excluded.access_token'
+      ).run([input.sessionToken]);
+      this.db.prepare(
+        `UPDATE activation_state
+         SET status='activated', username=?, updated_at=?
+         WHERE singleton=1`
+      ).run([input.username, now()]);
+    })();
+  }
+
   localAddress() {
     const account = this.account();
     if (!account.user_id) throw new Error('remote_account_not_registered');

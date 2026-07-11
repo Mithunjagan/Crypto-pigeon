@@ -1,16 +1,17 @@
 import http from 'node:http';
+import crypto from 'node:crypto';
 import Fastify from 'fastify';
 import type { FastifyRequest, FastifyReply } from 'fastify';
-import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
 import { z } from 'zod';
 import { env, loggerLevel, maxBodySize } from './config.js';
-import { logger } from './logger.js';
+import { logger, routeErrorDetails } from './logger.js';
 import { initDb, pool } from './db.js';
-import { setupAuthRoutes, adminAuthMiddleware, computeHmac } from './auth.js';
+import { setupAuthRoutes, timingSafeCompare } from './auth.js';
 import { setupPrekeysRoutes } from './prekeys.js';
 import { setupQueueRoutes } from './queue.js';
 import { setupAttachmentsRoutes } from './attachments.js';
+import { setupConversationRoutes } from './conversations.js';
 import { setupWebSocket } from './ws-handler.js';
 import { privacyPreservingKeyGenerator } from './rate-limit.js';
 
@@ -19,14 +20,11 @@ const app = Fastify({
   logger: false, // Use our custom redacting structured logger instead
   bodyLimit: maxBodySize
 });
+let relayReady = false;
 
-// Configure CORS and rate limiter
-await app.register(cors, {
-  origin: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  credentials: true
-});
-
+// Relay endpoints are daemon-to-relay APIs, not browser APIs.  Do not emit
+// Access-Control-Allow-Origin: it would let arbitrary web origins make
+// credentialed requests to a relay reachable from the browser.
 await app.register(rateLimit, {
   max: 100,
   timeWindow: '1 minute',
@@ -38,6 +36,7 @@ setupAuthRoutes(app);
 setupPrekeysRoutes(app);
 setupQueueRoutes(app);
 setupAttachmentsRoutes(app);
+setupConversationRoutes(app);
 
 // Helper for escaping HTML in admin dashboard
 const escapeHtml = (value: string) => value.replace(/[&<>'"]/g, char => ({
@@ -52,31 +51,56 @@ const escapeHtml = (value: string) => value.replace(/[&<>'"]/g, char => ({
 const cookie = (header: string | undefined, name: string) => 
   header?.split(';').map(value => value.trim().split('=')).find(([key]) => key === name)?.slice(1).join('=');
 
-const getAdminSession = (request: FastifyRequest): boolean => {
+const adminSessions = new Map<string, { csrfToken: string; expiresAt: number }>();
+
+const getAdminSession = (request: FastifyRequest) => {
   const token = cookie(request.headers.cookie, 'crypto_pigeon_admin');
-  return token === env.ADMIN_TOKEN;
+  if (!token) return null;
+  const session = adminSessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) {
+    adminSessions.delete(token);
+    return null;
+  }
+  return session;
 };
 
 // Admin authentication guard for routes
 const requireAdminGuard = async (request: FastifyRequest, reply: FastifyReply) => {
-  if (!getAdminSession(request)) {
+  const session = getAdminSession(request);
+  if (!session) {
     return reply.code(401).send({ error: 'admin_auth_required' });
+  }
+  const csrfHeader = request.headers['x-csrf-token'];
+  const csrfToken = Array.isArray(csrfHeader) ? csrfHeader[0] ?? '' : csrfHeader ?? '';
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(request.method) && !timingSafeCompare(csrfToken, session.csrfToken)) {
+    return reply.code(403).send({ error: 'admin_csrf_invalid' });
   }
 };
 
 // Admin UI Dashboard Routes
 app.post('/api/admin/login', async (request: FastifyRequest, reply: FastifyReply) => {
   const { username, password } = z.object({ username: z.string(), password: z.string() }).parse(request.body);
-  const isValid = username === env.ADMIN_USERNAME && password === env.ADMIN_TOKEN;
+  const isValid = timingSafeCompare(username, env.ADMIN_USERNAME) && timingSafeCompare(password, env.ADMIN_TOKEN);
   if (!isValid) {
     return reply.code(401).send({ error: 'invalid_admin_credentials' });
   }
-  reply.header('Set-Cookie', `crypto_pigeon_admin=${env.ADMIN_TOKEN}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`);
+  const sessionToken = crypto.randomBytes(32).toString('base64url');
+  const csrfToken = crypto.randomBytes(32).toString('base64url');
+  adminSessions.set(sessionToken, { csrfToken, expiresAt: Date.now() + 8 * 60 * 60 * 1000 });
+  reply.header('Set-Cookie', [
+    `crypto_pigeon_admin=${sessionToken}; HttpOnly; SameSite=Strict; Path=/; Max-Age=28800`,
+    `crypto_pigeon_admin_csrf=${csrfToken}; SameSite=Strict; Path=/; Max-Age=28800`
+  ]);
   return { ok: true };
 });
 
-app.post('/api/admin/logout', async (_request: FastifyRequest, reply: FastifyReply) => {
-  reply.header('Set-Cookie', 'crypto_pigeon_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0');
+app.post('/api/admin/logout', { preHandler: requireAdminGuard }, async (request: FastifyRequest, reply: FastifyReply) => {
+  const sessionToken = cookie(request.headers.cookie, 'crypto_pigeon_admin');
+  if (sessionToken) adminSessions.delete(sessionToken);
+  reply.header('Set-Cookie', [
+    'crypto_pigeon_admin=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
+    'crypto_pigeon_admin_csrf=; SameSite=Strict; Path=/; Max-Age=0'
+  ]);
   return reply.code(204).send();
 });
 
@@ -122,9 +146,9 @@ app.post('/api/admin/appeals/:appealId/approve', { preHandler: requireAdminGuard
     await client.query('COMMIT');
     return { ok: true };
   } catch (error) {
-    await client.query('ROLLBACK');
-    logger.error({ err: error }, 'Failed to approve appeal');
-    return reply.code(500).send({ error: 'internal_error' });
+    await client.query('ROLLBACK').catch(() => undefined);
+    logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Failed to approve appeal');
+    return reply.code(500).send({ error: 'INTERNAL_ERROR' });
   } finally {
     client.release();
   }
@@ -178,23 +202,33 @@ app.get('/admin', async (request: FastifyRequest, reply: FastifyReply) => {
   
   const activeRows = active.rows.map(value => `<tr><td>${escapeHtml(value.one_name)}</td><td>${escapeHtml(value.two_name)}</td><td>${new Date(value.activated_at).toLocaleString()}</td><td><button class="cancel" onclick="cancelConnection('${value.user_one}','${value.user_two}')">Cancel connection</button></td></tr>`).join('') || '<tr><td colspan="4">No active connections.</td></tr>';
   
-  return reply.type('text/html').send(`<!doctype html><title>Crypto Pigeon Admin</title><style>body{font:16px system-ui;background:#102018;color:#eaf3ef;max-width:900px;margin:5vh auto;padding:24px}table{width:100%;border-collapse:collapse;margin-bottom:32px}td,th{padding:12px;border-bottom:1px solid #456;text-align:left}button{padding:8px 12px;border:0;border-radius:6px;background:#8fd4a8;font-weight:700}.cancel{background:#e8a29b}</style><h1>Crypto Pigeon Admin</h1><p>Approve or cancel connections. This dashboard cannot read messages, files, or connection passkeys.</p><h2>Pending appeals</h2><table><thead><tr><th>Requester</th><th>Target</th><th>Requested</th><th>Decision</th></tr></thead><tbody>${rows}</tbody></table><h2>Active chats</h2><table><thead><tr><th>User one</th><th>User two</th><th>Activated</th><th>Control</th></tr></thead><tbody>${activeRows}</tbody></table><p><button onclick="logout()">Sign out</button></p><script>async function decide(id,action){let r=await fetch('/api/admin/appeals/'+id+'/'+action,{method:'POST'});if(r.ok)location.reload();else alert('Action failed');}async function cancelConnection(a,b){let r=await fetch('/api/admin/connections/'+a+'/'+b+'/cancel',{method:'POST'});if(r.ok)location.reload();else alert('Cancel failed');}async function logout(){await fetch('/api/admin/logout',{method:'POST'});location.reload();}</script>`);
+  return reply.type('text/html').send(`<!doctype html><title>Crypto Pigeon Admin</title><style>body{font:16px system-ui;background:#102018;color:#eaf3ef;max-width:900px;margin:5vh auto;padding:24px}table{width:100%;border-collapse:collapse;margin-bottom:32px}td,th{padding:12px;border-bottom:1px solid #456;text-align:left}button{padding:8px 12px;border:0;border-radius:6px;background:#8fd4a8;font-weight:700}.cancel{background:#e8a29b}</style><h1>Crypto Pigeon Admin</h1><p>Approve or cancel connections. This dashboard cannot read messages, files, or connection passkeys.</p><h2>Pending appeals</h2><table><thead><tr><th>Requester</th><th>Target</th><th>Requested</th><th>Decision</th></tr></thead><tbody>${rows}</tbody></table><h2>Active chats</h2><table><thead><tr><th>User one</th><th>User two</th><th>Activated</th><th>Control</th></tr></thead><tbody>${activeRows}</tbody></table><p><button onclick="logout()">Sign out</button></p><script>function csrf(){return document.cookie.split('; ').find(v=>v.startsWith('crypto_pigeon_admin_csrf='))?.split('=').slice(1).join('=')||''}function opts(){return {method:'POST',headers:{'X-CSRF-Token':csrf()}}}async function decide(id,action){let r=await fetch('/api/admin/appeals/'+id+'/'+action,opts());if(r.ok)location.reload();else alert('Action failed');}async function cancelConnection(a,b){let r=await fetch('/api/admin/connections/'+a+'/'+b+'/cancel',opts());if(r.ok)location.reload();else alert('Cancel failed');}async function logout(){await fetch('/api/admin/logout',opts());location.reload();}</script>`);
 });
 
 // Health check
 app.get('/healthz', async () => ({ ok: true }));
+app.get('/readyz', async (_request: FastifyRequest, reply: FastifyReply) => {
+  if (!relayReady) return reply.code(503).send({ ok: false, error: 'initializing' });
+  try {
+    await pool.query('SELECT 1');
+    return { ok: true };
+  } catch {
+    return reply.code(503).send({ ok: false, error: 'database_unavailable' });
+  }
+});
 
 // Global error handler mapping Zod errors to 400
-app.setErrorHandler((error, _request, reply) => {
+app.setErrorHandler((error, request, reply) => {
   if (error instanceof z.ZodError) {
-    return reply.code(400).send({ error: 'invalid_request', details: error.errors });
+    return reply.code(400).send({ error: 'INVALID_REQUEST' });
   }
-  logger.error({ err: error }, 'Unhandled server error');
-  return reply.code(500).send({ error: 'internal_error' });
+  logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Unhandled server error');
+  return reply.code(500).send({ error: 'INTERNAL_ERROR' });
 });
 
 // Run DB setup and migrations
 await initDb();
+relayReady = true;
 
 // Bind WebSocket to standard server
 setupWebSocket(app.server);

@@ -1,0 +1,4 @@
+# Historical backup intentionally retained by the user.
+#
+# Do not use this file to build the project.  The maintained relay-only,
+# Node 22 multi-stage image is Dockerfile in the repository root.
