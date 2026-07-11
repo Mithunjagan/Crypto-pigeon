@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.env
+.crypto_pigeon/
+npm-debug.log*

@@ -1,0 +1,24 @@
+{
+  "name": "@crypto-pigeon/tests",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node -e \"console.log('No build needed')\"",
+    "test": "tsx src/run-tests.ts"
+  },
+  "dependencies": {
+    "@crypto-pigeon/protocol": "*",
+    "@crypto-pigeon/shared-types": "*",
+    "argon2": "^0.41.1",
+    "pg": "^8.13.3",
+    "@signalapp/libsignal-client": "0.96.4",
+    "@signalapp/sqlcipher": "3.3.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.19",
+    "@types/pg": "^8.11.11",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  }
+}

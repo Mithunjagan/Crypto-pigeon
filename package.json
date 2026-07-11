@@ -1,0 +1,16 @@
+{
+  "name": "crypto-pigeon",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Privacy-first E2EE chat MVP",
+  "workspaces": ["apps/*", "packages/*"],
+  "scripts": {
+    "dev:relay": "npm run dev --workspace=@crypto-pigeon/relay-server",
+    "dev:daemon": "npm run dev --workspace=@crypto-pigeon/local-daemon",
+    "dev:ui": "npm run dev --workspace=@crypto-pigeon/local-ui",
+    "admin": "npm run start --workspace=@crypto-pigeon/admin-cli --",
+    "build": "npm run build --workspaces",
+    "test": "npm run test --workspaces"
+  },
+  "engines": { "node": ">=22" }
+}

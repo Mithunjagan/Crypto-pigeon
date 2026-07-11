@@ -1,0 +1,33 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: crypto_pigeon
+      POSTGRES_USER: crypto_pigeon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crypto_pigeon -d crypto_pigeon"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+  relay:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://crypto_pigeon:${POSTGRES_PASSWORD}@postgres:5432/crypto_pigeon
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:?set ADMIN_USERNAME in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      HOST: 0.0.0.0
+      PORT: 8443
+    ports:
+      - "127.0.0.1:8443:8443"
+volumes:
+  postgres_data:
