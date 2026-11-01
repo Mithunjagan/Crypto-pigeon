@@ -1,3 +1,4 @@
+import { registerVaultTests } from './vault-tests.js';
 import crypto from 'node:crypto';
 import argon2 from 'argon2';
 import { validatePasswordStrength, wrapVmk, unwrapVmk, deriveSubkey } from '../../../apps/local-daemon/src/vault-keys.js';
@@ -199,6 +200,7 @@ async function runAll() {
     if (JSON.stringify(value).includes(secret)) throw new Error('Secret appeared in redacted log value');
   });
 
+  registerVaultTests(test);
   await Promise.all(pendingTests);
   console.log('\n======================================================');
   console.log(`Test Execution Completed. Passed: ${passedTestsCount}, Failed: ${failedTestsCount}`);

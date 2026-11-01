@@ -102,6 +102,8 @@ export class RelayClient {
 
     const headers = new Headers(options.headers || {});
     headers.set('Authorization', `Bearer ${token}`);
+    const instance = vault.database().prepare('SELECT token FROM vault_instance WHERE singleton=1').get<{token:string}>();
+    if(instance)headers.set('X-Vault-Instance',instance.token);
     options.headers = headers;
 
     let res = await fetch(`${this.relayUrl}${path}`, options);

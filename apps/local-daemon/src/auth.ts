@@ -54,7 +54,7 @@ export function verifyLocalSession(request: FastifyRequest, reply: FastifyReply,
   }
 
   // Skip session check for bootstrap, session query, and vault create/open
-  if (url === '/api/bootstrap' || url === '/api/session' || url === '/api/vault/create' || url === '/api/vault/open' || url === '/api/vault/status') {
+  if (url === '/api/bootstrap' || url === '/api/session' || url === '/api/vault/status') {
     return;
   }
 
@@ -76,6 +76,8 @@ export function verifyLocalSession(request: FastifyRequest, reply: FastifyReply,
       return reply.code(403).send({ error: 'invalid_csrf_token' });
     }
   }
+
+  if(['/api/vault/create','/api/vault/open','/api/vault/restore','/api/vault/horcrux-status'].includes(url.split('?')[0]))return;
 
   // 5. Verify Vault is unlocked
   if (vault.isLocked()) {
@@ -135,3 +137,5 @@ export function setupAuthRoutes(app: any, vault: Vault) {
 export function getSessionGeneration(): number {
   return activeSession?.generation ?? 0;
 }
+
+export function nextBootstrapSecret() { invalidateSession(); return generateBootstrapSecret(currentPort); }

@@ -1,7 +1,7 @@
+import { VaultGate, FragmentShield, shardStorageKey } from './VaultGate';
+import { UidBadge } from './UidBadge';
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Lock,
-  Unlock,
   UserPlus,
   Send,
   Image,
@@ -11,20 +11,25 @@ import {
   AlertTriangle,
   RefreshCw,
   LogOut,
-  CheckCircle,
-  KeyRound
+  CheckCircle
 } from 'lucide-react';
 
 export default function App() {
   const [csrfToken, setCsrfToken] = useState<string | null>(null);
   const [vaultState, setVaultState] = useState<'unconfigured' | 'locked' | 'unlocked' | 'bootstrapping'>('bootstrapping');
-  
+
+  const [busy,setBusy]=useState(false);
+  const [requiresVaultId,setRequiresVaultId]=useState(true);
+  const [fragmentStatus,setFragmentStatus]=useState<any>(null);
+  const [publicUid,setPublicUid]=useState('');
+  const [mobilePane,setMobilePane]=useState('contacts');
+  const [showSafety,setShowSafety]=useState(false);
+  const [timer,setTimer]=useState(0);
   // Forms
-  const [password, setPassword] = useState('');
-  const [passwordConfirm, setPasswordConfirm] = useState('');
+  const [changeVaultId,setChangeVaultId]=useState('');
   const [oldPassword, setOldPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
-  
+
   // App State
   const [contacts, setContacts] = useState<any[]>([]);
   const [selectedContact, setSelectedContact] = useState<any | null>(null);
@@ -32,13 +37,13 @@ export default function App() {
   const [inputText, setInputText] = useState('');
   const [newContactUsername, setNewContactUsername] = useState('');
   const [incomingRequests, setIncomingRequests] = useState<any[]>([]);
-  
+
   // UI Panels
   const [showSettings, setShowSettings] = useState(false);
   const [showAddContact, setShowAddContact] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [infoMsg, setInfoMsg] = useState<string | null>(null);
-  
+
   // Registration / Activation
   const [requestId, setRequestId] = useState('');
   const [activationCode, setActivationCode] = useState('');
@@ -105,9 +110,9 @@ export default function App() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const bootstrapSession = async () => {
+  const bootstrapSession = async (providedSecret?:string) => {
     try {
-      const hash = window.location.hash.slice(1);
+      const hash = providedSecret ?? window.location.hash.slice(1);
       let res;
       if (hash) {
         res = await fetch('/api/bootstrap', {
@@ -125,8 +130,11 @@ export default function App() {
         const data = await res.json();
         setCsrfToken(data.csrfToken);
         setVaultState(data.vaultState);
+        const status=await fetch('/api/vault/status').then(r=>r.json());
+        setRequiresVaultId(status.requiresVaultId ?? true);
+        await loadFragmentStatus();
       } else {
-        setVaultState('unconfigured');
+        setVaultState('locked');setErrorMsg('Open the single-use bootstrap link from your paired daemon to connect this browser.');
       }
     } catch {
       setVaultState('unconfigured');
@@ -138,7 +146,7 @@ export default function App() {
     if (csrfToken) {
       headers.set('X-CSRF-Token', csrfToken);
     }
-    if (!headers.has('Content-Type') && !(options.body instanceof FormData)) {
+    if (options.body != null && !headers.has('Content-Type') && !(options.body instanceof FormData)) {
       headers.set('Content-Type', 'application/json');
     }
     options.headers = headers;
@@ -175,7 +183,8 @@ export default function App() {
     try {
       const res = await apiFetch('/api/access/state');
       if (!res.ok) return;
-      const data = await res.json() as { requestId?: string; username?: string; status?: 'idle' | 'pending' | 'activated' };
+      const data = await res.json() as { publicUid?:string; requestId?: string; username?: string; status?: 'idle' | 'pending' | 'activated' };
+      if(data.publicUid)setPublicUid(data.publicUid);
       if (data.status === 'pending' && data.requestId) {
         setRequestId(data.requestId);
         setRegUsername(data.username || '');
@@ -188,59 +197,38 @@ export default function App() {
     }
   };
 
-  const handleCreateVault = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (password !== passwordConfirm) {
-      setErrorMsg('Passwords do not match');
-      return;
-    }
-    try {
-      const res = await apiFetch('/api/vault/create', {
-        method: 'POST',
-        body: JSON.stringify({ password })
-      });
-      if (res.ok) {
-        await bootstrapSession();
-        setPassword('');
-        setPasswordConfirm('');
-        setErrorMsg(null);
-      } else {
-        const data = await res.json();
-        setErrorMsg(data.error || 'Failed to create vault');
-      }
-    } catch {
-      setErrorMsg('Network error occurred');
-    }
+  const loadFragmentStatus=async()=>{
+    const present=!!localStorage.getItem(shardStorageKey);
+    try {const r=await fetch('/api/vault/horcrux-status?clientPresent='+present);if(r.ok)setFragmentStatus(await r.json());}catch{}
   };
-
-  const handleUnlockVault = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const submitVault=async(mode:string,vaultId:string,password:string,confirm:string)=>{
+    if(mode==='create'&&password!==confirm){setErrorMsg('Passwords do not match');return;}
+    setBusy(true);setErrorMsg(null);
     try {
-      const res = await apiFetch('/api/vault/open', {
-        method: 'POST',
-        body: JSON.stringify({ password })
-      });
-      if (res.ok) {
-        await bootstrapSession();
-        setPassword('');
-        setErrorMsg(null);
-      } else {
-        const data = await res.json();
-        setErrorMsg(data.error || 'Invalid password');
-      }
-    } catch {
-      setErrorMsg('Network error occurred');
-    }
+      const r=await apiFetch('/api/vault/'+mode,{method:'POST',body:JSON.stringify({vaultId:vaultId || (!requiresVaultId?'legacy-local':''),password,
+        clientShard:localStorage.getItem(shardStorageKey)??undefined,transferConfirmed:mode==='restore'?true:undefined})});
+      const data=await r.json();
+      if(!r.ok)throw new Error(data.error || 'Vault operation failed');
+      if(data.clientShard)localStorage.setItem(shardStorageKey,data.clientShard);
+      await bootstrapSession();
+    }catch(e:any){setErrorMsg(e.message==='HORCRUX_INCOMPLETE_RESTORE_REQUIRED'?'A fragment is missing or corrupted. Choose Restore to recover your encrypted backup.':e.message);}
+    finally{setBusy(false);}
   };
 
   const handleLockVault = async () => {
     try {
       const res = await apiFetch('/api/vault/lock', { method: 'POST' });
       if (res.ok) {
+        const result=await res.json();
+        if(!result.backupSynced)setErrorMsg('Vault locked, but backup sync failed. The relay may have an older backup.');
         setVaultState('locked');
         setCsrfToken(null);
         setSelectedContact(null);
         setMessages([]);
+        setContacts([]);setIncomingRequests([]);setPublicUid('');setRegistrationState('idle');
+        await bootstrapSession(result.bootstrapSecret);
+      } else {
+        setErrorMsg(await responseError(res,'Could not sync and lock the vault'));
       }
     } catch {
       setErrorMsg('Failed to lock vault');
@@ -252,10 +240,13 @@ export default function App() {
     try {
       const res = await apiFetch('/api/vault/change-password', {
         method: 'POST',
-        body: JSON.stringify({ oldPassword, newPassword })
+        body: JSON.stringify({ vaultId:changeVaultId,oldPassword,newPassword })
       });
       if (res.ok) {
-        setInfoMsg('Password changed successfully');
+        const result=await res.json();
+        if(result.clientShard)localStorage.setItem(shardStorageKey,result.clientShard);
+        setChangeVaultId('');
+        setInfoMsg('Password changed successfully; previous relay backup removed');
         setOldPassword('');
         setNewPassword('');
         setShowSettings(false);
@@ -408,6 +399,7 @@ export default function App() {
       const res = await apiFetch('/api/fetch-messages', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
+        if(data.backupSynced===false)setErrorMsg('Messages received, but backup sync failed. Retry backup in Settings.');
         if (data.received > 0 && selectedContact) {
           loadMessages(selectedContact.conversation_id);
         }
@@ -432,6 +424,7 @@ export default function App() {
         })
       });
       if (res.ok) {
+        const result=await res.json();if(result.backupSynced===false)setErrorMsg('Message sent, but cloud backup did not sync. Retry backup in Settings.');
         setInputText('');
         loadMessages(selectedContact.conversation_id);
       } else {
@@ -447,6 +440,7 @@ export default function App() {
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file || !selectedContact) return;
+    if(file.size>25*1024*1024){setErrorMsg('Attachments must be 25 MiB or smaller');return;}
 
     const reader = new FileReader();
     reader.onload = async () => {
@@ -504,6 +498,7 @@ export default function App() {
       };
 
       mediaRecorder.onstop = async () => {
+        stream.getTracks().forEach(track=>track.stop());
         const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/webm' });
         const reader = new FileReader();
         reader.onload = async () => {
@@ -582,94 +577,30 @@ export default function App() {
         </div>
       )}
 
-      {/* Vault Unconfigured (Create Vault) */}
-      {vaultState === 'unconfigured' && (
-        <div className="flex items-center justify-center h-full p-4">
-          <div className="glass-panel w-full max-w-md p-8 flex flex-col gap-6 animate-fade-in">
-            <div className="flex flex-col items-center gap-2">
-              <div className="p-4 bg-indigo-500/10 rounded-full text-indigo-400">
-                <Lock size={40} />
-              </div>
-              <h1 className="text-2xl font-bold tracking-tight">Create Secure Vault</h1>
-              <p className="text-sm text-slate-400 text-center">
-                Configure your database vault. Use a strong password to generate your 256-bit local master key.
-              </p>
-            </div>
-
-            <form onSubmit={handleCreateVault} className="flex flex-col gap-4">
-              <input
-                type="password"
-                placeholder="Vault Password (min. 12 characters)"
-                className="glass-input"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-              <input
-                type="password"
-                placeholder="Confirm Vault Password"
-                className="glass-input"
-                value={passwordConfirm}
-                onChange={(e) => setPasswordConfirm(e.target.value)}
-              />
-              <button type="submit" className="btn-primary flex items-center justify-center gap-2 mt-2">
-                <KeyRound size={18} /> Initialize Vault
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
-
-      {/* Vault Locked (Unlock Vault) */}
-      {vaultState === 'locked' && (
-        <div className="flex items-center justify-center h-full p-4">
-          <div className="glass-panel w-full max-w-md p-8 flex flex-col gap-6 animate-fade-in">
-            <div className="flex flex-col items-center gap-2">
-              <div className="p-4 bg-indigo-500/10 rounded-full text-indigo-400">
-                <Unlock size={40} />
-              </div>
-              <h1 className="text-2xl font-bold tracking-tight">Vault Locked</h1>
-              <p className="text-sm text-slate-400 text-center">
-                Enter your vault password to decrypt local keys and authenticate database.
-              </p>
-            </div>
-
-            <form onSubmit={handleUnlockVault} className="flex flex-col gap-4">
-              <input
-                type="password"
-                placeholder="Vault Password"
-                className="glass-input"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-              />
-              <button type="submit" className="btn-primary flex items-center justify-center gap-2 mt-2">
-                Unlock Database
-              </button>
-            </form>
-          </div>
-        </div>
-      )}
+      {(vaultState==='unconfigured'||vaultState==='locked')&&<VaultGate state={vaultState} status={fragmentStatus} requiresVaultId={requiresVaultId} busy={busy} submit={submitVault}/>}
 
       {/* Main Unlocked Chat Client */}
       {vaultState === 'unlocked' && (
-        <div className="flex h-full w-full overflow-hidden">
+        <div className={`chat-shell flex h-full w-full overflow-hidden mobile-${mobilePane}`}>
           {/* Sidebar */}
-          <div className="w-80 border-r border-slate-800 flex flex-col h-full bg-slate-950/40">
+          <div className="contact-sidebar w-80 border-r border-slate-800 flex flex-col h-full bg-slate-950/40">
             <div className="p-4 border-b border-slate-800 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Shield size={22} className="text-indigo-400" />
                 <span className="font-bold tracking-wide">Crypto Pigeon</span>
               </div>
               <div className="flex items-center gap-1">
-                <button onClick={() => setShowSettings(true)} className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition">
+                <button onClick={() => {setShowSettings(true);void loadFragmentStatus();}} className="p-2 hover:bg-slate-800 rounded-lg text-slate-400 hover:text-white transition">
                   <Settings size={18} />
                 </button>
-                <button onClick={handleLockVault} className="p-2 hover:bg-red-950/20 hover:text-red-400 rounded-lg text-slate-400 transition" title="Lock Database">
-                  <LogOut size={18} />
+                <button onClick={handleLockVault} className="p-2 hover:bg-red-950/20 hover:text-red-400 rounded-lg text-slate-400 transition" title="Sync & Logout" aria-label="Sync & Logout">
+                  <LogOut size={18} /><span className="text-xs">Sync & Logout</span>
                 </button>
               </div>
             </div>
 
             <div className="p-4 flex flex-col gap-3">
+              {publicUid&&<UidBadge uid={publicUid}/>}
               <button onClick={() => setShowAddContact(true)} className="btn-secondary w-full flex items-center justify-center gap-2 py-2.5">
                 <UserPlus size={16} /> New Conversation
               </button>
@@ -699,7 +630,7 @@ export default function App() {
                   contacts.map(contact => (
                     <button
                       key={contact.contact_id}
-                      onClick={() => setSelectedContact(contact)}
+                      onClick={() => {setSelectedContact(contact);setMobilePane('chat');}}
                       className={`flex flex-col gap-1 w-full text-left p-3 rounded-lg transition ${selectedContact?.contact_id === contact.contact_id ? 'bg-indigo-600/20 border-l-4 border-indigo-500' : 'hover:bg-slate-900/50'}`}
                     >
                       <div className="flex items-center justify-between">
@@ -717,14 +648,14 @@ export default function App() {
           </div>
 
           {/* Chat Window */}
-          <div className="flex-1 flex flex-col h-full bg-slate-950/10">
+          <div className="chat-thread flex-1 flex flex-col h-full bg-slate-950/10 min-w-0">
             {selectedContact ? (
               <>
                 {/* Header */}
                 <div className="p-4 border-b border-slate-800 flex items-center justify-between bg-slate-950/25">
                   <div className="flex flex-col">
                     <span className="font-bold text-slate-100">{selectedContact.username}</span>
-                    <span className="text-xs text-slate-400">Safety Number: {selectedContact.safety_number_hash || 'Calculating...'}</span>
+                    <button type="button" className="text-xs text-indigo-300 text-left" onClick={()=>setShowSafety(true)}>View safety number</button>
                   </div>
                   <div className="flex items-center gap-2">
                     {selectedContact.verified === 1 ? (
@@ -748,9 +679,7 @@ export default function App() {
                         <strong>Security Warning:</strong> This contact's identity key has changed. E2EE session replacement blocked.
                       </span>
                     </div>
-                    <button className="btn-secondary py-1.5 px-3 text-xs bg-amber-500/10 border-amber-500/20 hover:bg-amber-500/20 text-amber-200">
-                      Approve Change
-                    </button>
+                    <span className="text-xs text-amber-200">Verify the new identity out of band before reconnecting.</span>
                   </div>
                 )}
 
@@ -762,6 +691,7 @@ export default function App() {
                       className={`flex flex-col max-w-lg rounded-xl p-3.5 shadow-sm animate-fade-in ${msg.direction === 'sent' ? 'self-end bg-indigo-600/30 text-indigo-50 border border-indigo-500/20' : 'self-start bg-slate-900/60 text-slate-100 border border-slate-800'}`}
                     >
                       <span className="text-sm leading-relaxed whitespace-pre-wrap">{msg.plaintext}</span>
+                      {msg.attachment_id&&<a className="text-xs underline mt-2" href={'/api/attachments/'+msg.attachment_id+'/decrypt?download=1'} download>Download decrypted attachment</a>}
                       <div className="flex items-center justify-between mt-1 text-[10px] text-slate-500">
                         <span>{new Date(msg.sent_at || msg.received_at).toLocaleTimeString()}</span>
                         {msg.status === 'sent' && <span className="ml-2">✓</span>}
@@ -771,6 +701,9 @@ export default function App() {
                   <div ref={messagesEndRef} />
                 </div>
 
+                <label className="flex gap-2 items-center text-xs text-slate-400 px-4 py-2">Disappearing messages<select aria-label="Disappearing message timer" className="glass-input py-1" value={timer} onChange={async e=>{
+                  const seconds=Number(e.target.value);const r=await apiFetch('/api/conversations/'+selectedContact.conversation_id+'/timer',{method:'POST',body:JSON.stringify({seconds})});if(r.ok)setTimer(seconds);else setErrorMsg('Could not update disappearing timer');
+                }}><option value={0}>Off</option><option value={3600}>1 hour</option><option value={86400}>1 day</option><option value={604800}>7 days</option></select></label>
                 {/* Footer Input */}
                 <form onSubmit={handleSendMessage} className="p-4 border-t border-slate-800 flex items-center gap-3 bg-slate-950/25">
                   <button
@@ -790,10 +723,9 @@ export default function App() {
 
                   <button
                     type="button"
-                    onMouseDown={startRecording}
-                    onMouseUp={stopRecording}
+                    onClick={()=>isRecording?stopRecording():startRecording()}
                     className={`p-3 border rounded-xl transition ${isRecording ? 'bg-red-600 text-white border-red-500 animate-pulse' : 'bg-slate-900 border-slate-800 text-slate-400 hover:bg-slate-800 hover:text-white'}`}
-                    title="Hold to Record Voice Note"
+                    title={isRecording?'Stop voice note':'Record voice note'} aria-label={isRecording?'Stop voice note':'Record voice note'}
                   >
                     <Mic size={18} />
                   </button>
@@ -821,6 +753,9 @@ export default function App() {
         </div>
       )}
 
+      {vaultState==='unlocked'&&<nav className="mobile-nav" aria-label="Main navigation"><button onClick={()=>setMobilePane('contacts')}>Contacts</button><button onClick={()=>setMobilePane('chat')}>Chat</button><button onClick={()=>setShowSettings(true)}>Settings</button></nav>}
+      {showSafety&&selectedContact&&<div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4"><section className="glass-panel p-6 max-w-md w-full" role="dialog" aria-modal="true" aria-label="Safety number"><h2 className="text-xl mb-4">Verify this conversation</h2><p className="text-sm text-slate-400 mb-4">Compare this number with your contact over another trusted channel. A match helps confirm the pinned identities.</p><code className="block break-all text-indigo-200">{selectedContact.safety_number_hash || 'Establish a session first'}</code><button className="btn-secondary mt-4" onClick={()=>setShowSafety(false)}>Close</button></section></div>}
+
       {/* Settings Modal */}
       {showSettings && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
@@ -829,9 +764,15 @@ export default function App() {
               <Settings size={20} className="text-indigo-400" /> Settings
             </h2>
 
+            <FragmentShield status={fragmentStatus}/>
+            <button className="btn-secondary" disabled={busy} onClick={async()=>{setBusy(true);try{
+              const r=await apiFetch('/api/vault/sync-backup',{method:'POST'});if(!r.ok)throw new Error('Encrypted backup sync failed');
+              await loadFragmentStatus();setInfoMsg('Encrypted backup synchronized');
+            }catch(e:any){setErrorMsg(e.message);}finally{setBusy(false);}}}>Sync encrypted backup</button>
             {/* Change Password Form */}
             <form onSubmit={handleChangePassword} className="flex flex-col gap-4">
               <h3 className="text-sm font-semibold text-slate-300">Change Vault Password</h3>
+              <input type="password" required minLength={8} placeholder="Secret Vault ID" className="glass-input" value={changeVaultId} onChange={e=>setChangeVaultId(e.target.value)} />
               <input
                 type="password"
                 placeholder="Old Password"
@@ -908,7 +849,7 @@ export default function App() {
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="glass-panel w-full max-w-md p-6 flex flex-col gap-6 animate-fade-in">
             <h2 className="text-xl font-bold flex items-center gap-2">
-              <UserPlus size={20} className="text-indigo-400" /> Start Conversation
+              <UserPlus size={20} className="text-indigo-400" /> Follow by UID / Username
             </h2>
 
             <form onSubmit={handleAddContact} className="flex flex-col gap-4">
@@ -917,7 +858,7 @@ export default function App() {
               </p>
               <input
                 type="text"
-                placeholder="Contact Username"
+                placeholder="CP-XXXX-XXXX or username"
                 className="glass-input"
                 value={newContactUsername}
                 onChange={(e) => setNewContactUsername(e.target.value)}

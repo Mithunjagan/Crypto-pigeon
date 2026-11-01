@@ -3,13 +3,16 @@
   "private": true,
   "version": "0.1.0",
   "description": "Privacy-first E2EE chat MVP",
-  "workspaces": ["apps/*", "packages/*"],
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
   "scripts": {
     "dev:relay": "npm run dev --workspace=@crypto-pigeon/relay-server",
     "dev:daemon": "npm run dev --workspace=@crypto-pigeon/local-daemon",
     "dev:ui": "npm run dev --workspace=@crypto-pigeon/local-ui",
     "admin": "npm run start --workspace=@crypto-pigeon/admin-cli --",
-    "build": "npm run build --workspaces",
+    "build": "npm run build:shared && npm run build --workspaces",
     "test": "npm run test --workspaces --if-present",
     "test:unit": "npm run test --workspace=@crypto-pigeon/tests",
     "typecheck": "npm run build --workspaces",
@@ -17,7 +20,15 @@
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
     "docker:reset-dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/reset-dev.ps1",
-    "verify": "npm run build && npm run test && git diff --check"
+    "verify": "npm run build && npm run test && git diff --check",
+    "dev:daemon:mobile": "node scripts/mobile-daemon.mjs",
+    "android:build": "node scripts/android-build.mjs",
+    "android:usb": "node scripts/usb-mobile-deploy.mjs",
+    "build:shared": "npm run build --workspace=@crypto-pigeon/shared-types && npm run build --workspace=@crypto-pigeon/protocol",
+    "test:integration": "node scripts/feature-integration.mjs",
+    "setup:dev": "node scripts/setup-local-dev.mjs"
   },
-  "engines": { "node": ">=22" }
+  "engines": {
+    "node": ">=22"
+  }
 }

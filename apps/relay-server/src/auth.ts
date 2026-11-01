@@ -10,7 +10,7 @@ import {
   challengeVerifySchema,
   activationPayloadSchema,
   verifyChallenge,
-  usernameSchema
+  usernameSchema, formatPublicUid
 } from '@crypto-pigeon/protocol';
 
 // In-memory challenge store: deviceId -> { challenge, expiresAt }
@@ -53,6 +53,11 @@ export const authMiddleware = async (request: FastifyRequest, reply: FastifyRepl
       return reply.code(401).send({ error: 'unauthorized_invalid_token' });
     }
 
+    const lock = (await pool.query('SELECT instance_hash FROM device_vault_locks WHERE device_id=$1',[result.rows[0].device_id])).rows[0];
+    const instance = request.headers['x-vault-instance'];
+    if(lock && (typeof instance!=='string' || crypto.createHash('sha256').update(instance).digest('hex')!==lock.instance_hash)) {
+      return reply.code(409).send({error:'VAULT_MOVED_RESTORE_REQUIRED'});
+    }
     request.user = {
       deviceId: result.rows[0].device_id
     };
@@ -233,7 +238,7 @@ export function setupAuthRoutes(app: any) {
       // existing account instead of creating a second device.
       if (requestRow.status === 'activated') {
         const existing = await client.query(
-          `SELECT u.user_id, d.device_id, u.username, d.identity_public_key, d.auth_public_key
+          `SELECT u.user_id, d.device_id, u.username, u.public_uid, d.identity_public_key, d.auth_public_key
            FROM users u JOIN device_identity_keys d ON d.user_id=u.user_id
            WHERE u.username=$1 AND d.device_id=$2 AND d.revoked_at IS NULL`,
           [requestRow.username, payload.deviceId]
@@ -248,7 +253,7 @@ export function setupAuthRoutes(app: any) {
         const sessionToken = crypto.randomBytes(32).toString('base64url');
         const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
         await pool.query('INSERT INTO sessions (token, device_id, expires_at) VALUES ($1, $2, $3)', [sessionToken, device.device_id, expiresAt]);
-        return reply.code(200).send({ sessionToken, expiresAt, userId: device.user_id, deviceId: device.device_id, username: device.username });
+        return reply.code(200).send({ sessionToken, expiresAt, userId: device.user_id, deviceId: device.device_id, username: device.username, publicUid: device.public_uid });
       }
 
       if (requestRow.status !== 'approved') {
@@ -283,9 +288,15 @@ export function setupAuthRoutes(app: any) {
       const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
 
       // 1. Create User
+      let publicUid=formatPublicUid(userId), uidAttempt=0;
+      while(true){
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,1))',[publicUid]);
+        if(!(await client.query('SELECT 1 FROM users WHERE public_uid=$1',[publicUid])).rowCount)break;
+        publicUid=formatPublicUid(userId+':'+(++uidAttempt));
+      }
       await client.query(
-        'INSERT INTO users (user_id, username, password_hash) VALUES ($1, $2, \'device_auth_only\')',
-        [userId, requestRow.username]
+        'INSERT INTO users (user_id, username, password_hash, public_uid) VALUES ($1, $2, \'device_auth_only\', $3)',
+        [userId, requestRow.username, publicUid]
       );
 
       // 2. Create Device
@@ -358,7 +369,7 @@ export function setupAuthRoutes(app: any) {
 
       await client.query('COMMIT');
 
-      return reply.code(201).send({ sessionToken, expiresAt, userId, deviceId, username: requestRow.username });
+      return reply.code(201).send({ sessionToken, expiresAt, userId, deviceId, username: requestRow.username, publicUid });
     } catch (error) {
       await client.query('ROLLBACK').catch(() => undefined);
       logger.error(routeErrorDetails(error, request.method, request.routeOptions.url ?? request.url), 'Activation failed');

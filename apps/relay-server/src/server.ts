@@ -11,6 +11,7 @@ import { setupAuthRoutes, timingSafeCompare } from './auth.js';
 import { setupPrekeysRoutes } from './prekeys.js';
 import { setupQueueRoutes } from './queue.js';
 import { setupAttachmentsRoutes } from './attachments.js';
+import { setupVaultBackupRoutes } from './vault-backup.js';
 import { setupConversationRoutes } from './conversations.js';
 import { setupWebSocket } from './ws-handler.js';
 import { privacyPreservingKeyGenerator } from './rate-limit.js';
@@ -37,6 +38,7 @@ setupPrekeysRoutes(app);
 setupQueueRoutes(app);
 setupAttachmentsRoutes(app);
 setupConversationRoutes(app);
+setupVaultBackupRoutes(app);
 
 // Helper for escaping HTML in admin dashboard
 const escapeHtml = (value: string) => value.replace(/[&<>'"]/g, char => ({

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import type { IncomingMessage } from 'node:http';
 import { parse } from 'node:url';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -39,6 +40,9 @@ export function setupWebSocket(server: any) {
       }
 
       const deviceId = result.rows[0].device_id;
+      const lock=(await pool.query('SELECT instance_hash FROM device_vault_locks WHERE device_id=$1',[deviceId])).rows[0];
+      if(lock && (typeof request.headers['x-vault-instance']!=='string' || crypto.createHash('sha256').update(request.headers['x-vault-instance']).digest('hex')!==lock.instance_hash)){socket.destroy();return;}
+
 
       wss.handleUpgrade(request, socket, head, (ws: WebSocket) => {
         // Register client
@@ -51,7 +55,9 @@ export function setupWebSocket(server: any) {
           isAlive = true;
         });
 
-        const pingInterval = setInterval(() => {
+        const pingInterval = setInterval(async () => {
+          const active=await pool.query('SELECT 1 FROM sessions WHERE token=$1 AND expires_at>$2',[token,Date.now()]).catch(()=>null);
+          if(!active?.rowCount){ws.terminate();return;}
           if (!isAlive) {
             ws.terminate();
             return;
