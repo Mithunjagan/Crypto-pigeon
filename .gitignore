@@ -4,3 +4,13 @@ dist/
 .env.backup
 .crypto_pigeon/
 npm-debug.log*
+
+.crypto_pigeon_mobile/
+artifacts/
+apps/mobile-android/.gradle/
+apps/mobile-android/local.properties
+apps/mobile-android/app/build/
+apps/mobile-android/app/src/main/assets/
+apps/mobile-android/build/
+.crypto_pigeon_mobile.*/
+.crypto_pigeon.*/

@@ -53,11 +53,11 @@ async function setPlatformPermissions(dir: string, configPath: string, dbPath: s
 }
 
 export class Vault {
-  private readonly rootDir: string;
-  private readonly configPath: string;
-  private readonly databasePath: string;
+  protected readonly rootDir: string;
+  protected readonly configPath: string;
+  protected readonly databasePath: string;
   
-  private config: WrappedVmkConfig | null = null;
+  protected config: WrappedVmkConfig | null = null;
   private db: Database | null = null;
   
   // In-memory derived subkeys
@@ -178,7 +178,7 @@ export class Vault {
     }
   }
 
-  private async openDb(vmk: Buffer, hkdfSalt: Buffer) {
+  protected async openDb(vmk: Buffer, hkdfSalt: Buffer) {
     // Derive contextual subkeys
     const sqlcipherKey = deriveSubkey(vmk, hkdfSalt, 'sqlcipher-key-v1');
     this.fieldEncryptionKey = deriveSubkey(vmk, hkdfSalt, 'field-aead-v1');
@@ -209,14 +209,19 @@ export class Vault {
 
     this.db = db;
     this.initializeSchema();
+    const columns=db.prepare('PRAGMA table_info(contacts)').all<{name:string}>();
+    if(!columns.some(c=>c.name==='public_uid'))db.exec('ALTER TABLE contacts ADD COLUMN public_uid TEXT');
   }
 
   private initializeSchema() {
     if (!this.db) return;
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS vault_instance (singleton INTEGER PRIMARY KEY CHECK(singleton=1), token TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS account_public (singleton INTEGER PRIMARY KEY CHECK(singleton=1), public_uid TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS contacts (
         contact_id TEXT PRIMARY KEY, 
-        username TEXT NOT NULL, 
+        username TEXT NOT NULL,
+        public_uid TEXT,
         identity_public_key BLOB NOT NULL, 
         verified INTEGER NOT NULL DEFAULT 0, 
         safety_number_hash TEXT, 

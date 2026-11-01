@@ -144,7 +144,7 @@ export function setupPrekeysRoutes(app: any) {
   app.post('/api/prekeys/bundle', { preHandler: authMiddleware }, async (request: FastifyRequest, reply: FastifyReply) => {
     const body = z.object({
       recipientDeviceId: deviceIdSchema.optional(),
-      recipientUsername: z.string().trim().toLowerCase().optional()
+      recipientUsername: z.string().trim().transform(v => v.toUpperCase().startsWith('CP-') ? v.toUpperCase() : v.toLowerCase()).optional()
     }).parse(request.body);
 
     if (!body.recipientDeviceId && !body.recipientUsername) {
@@ -162,7 +162,7 @@ export function setupPrekeysRoutes(app: any) {
           `SELECT d.device_id 
            FROM users u 
            JOIN device_identity_keys d ON d.user_id = u.user_id 
-           WHERE u.username = $1 AND d.revoked_at IS NULL`,
+           WHERE (u.username = $1 OR u.public_uid = $1) AND d.revoked_at IS NULL`,
           [body.recipientUsername]
         );
         if (userRes.rows.length === 0) {
@@ -197,7 +197,7 @@ export function setupPrekeysRoutes(app: any) {
 
       // 2. Fetch device identity details
       const deviceRes = await client.query(
-        `SELECT d.user_id, d.identity_public_key, d.registration_id, d.signal_device_id, u.username
+        `SELECT d.user_id, d.identity_public_key, d.registration_id, d.signal_device_id, u.username, u.public_uid
          FROM device_identity_keys d
          JOIN users u ON u.user_id = d.user_id
          WHERE d.device_id = $1 AND d.revoked_at IS NULL`,
@@ -304,7 +304,9 @@ export function setupPrekeysRoutes(app: any) {
         recipientUserId: deviceRow.user_id,
         recipientDeviceId: targetDeviceId,
         recipientUsername: deviceRow.username,
+        publicUid: deviceRow.public_uid,
         identityKey: Buffer.from(deviceRow.identity_public_key).toString('base64'),
+        identityPublicKey: Buffer.from(deviceRow.identity_public_key).toString('base64'),
         registrationId: deviceRow.registration_id,
         signedPrekey: {
           id: signedRow.signal_prekey_id,

@@ -1,6 +1,6 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { z } from 'zod';
-import { usernameSchema } from '@crypto-pigeon/protocol';
+import { contactIdentifierSchema } from '@crypto-pigeon/protocol';
 import { authMiddleware } from './auth.js';
 import { pool } from './db.js';
 import { logger, routeErrorDetails } from './logger.js';
@@ -21,12 +21,12 @@ export function setupConversationRoutes(app: any) {
   // The recipient controls authorization. Searching/adding a contact does not
   // disclose its prekey bundle or permit delivery until this is accepted.
   app.post('/api/conversations/requests', { preHandler: authMiddleware }, async (request: FastifyRequest, reply: FastifyReply) => {
-    const { recipientUsername } = z.object({ recipientUsername: usernameSchema }).parse(request.body);
+    const { recipientUsername } = z.object({ recipientUsername: contactIdentifierSchema }).parse(request.body);
     const requesterUserId = await currentUserId(request.user!.deviceId);
     if (!requesterUserId) return reply.code(401).send({ error: 'device_not_active' });
 
     const recipient = await pool.query(
-      'SELECT user_id FROM users WHERE username = $1 AND revoked_at IS NULL',
+      'SELECT user_id FROM users WHERE (username = $1 OR public_uid = $1) AND revoked_at IS NULL',
       [recipientUsername]
     );
     // Do not distinguish an unknown and a non-connectable user to callers.
@@ -49,7 +49,7 @@ export function setupConversationRoutes(app: any) {
     const userId = await currentUserId(request.user!.deviceId);
     if (!userId) return [];
     const result = await pool.query(
-      `SELECT r.request_id, u.username AS requester_username, r.created_at, r.expires_at
+      `SELECT r.request_id, u.username AS requester_username, u.public_uid AS requester_public_uid, r.created_at, r.expires_at
        FROM connection_requests r JOIN users u ON u.user_id = r.requester_user_id
        WHERE r.recipient_user_id = $1 AND r.status = 'pending' AND r.expires_at > now()
        ORDER BY r.created_at`,

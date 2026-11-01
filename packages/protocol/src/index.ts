@@ -7,6 +7,38 @@ export const deviceIdSchema = z.string().uuid();
 export const base64Schema = z.string().regex(/^[A-Za-z0-9+/]+={0,2}$/);
 export const hexSchema = z.string().regex(/^[0-9a-fA-F]+$/);
 
+export const publicUidSchema = z.string().trim().toUpperCase().regex(/^CP-[A-F0-9]{4}-[A-F0-9]{4}$/);
+export const contactIdentifierSchema = z.union([publicUidSchema, usernameSchema]);
+export function formatPublicUid(fingerprint: string): string {
+  const hex = crypto.createHash('sha256').update('cp-public-uid-v1\0' + fingerprint).digest('hex').slice(0, 8).toUpperCase();
+  return `CP-${hex.slice(0, 4)}-${hex.slice(4)}`;
+}
+export const vaultCredentialsSchema = z.object({
+  vaultId: z.string().min(8).max(256), password: z.string().min(12).max(1024)
+});
+export const vaultOpenSchema = vaultCredentialsSchema.extend({ clientShard: base64Schema.length(64).optional() });
+export const vaultRestoreSchema = vaultCredentialsSchema.extend({ transferConfirmed: z.literal(true) });
+export const vaultSyncBackupSchema = z.object({});
+export const horcruxStatusSchema = z.object({
+  sharesPresent: z.number().int().min(0).max(7), totalShares: z.literal(7),
+  locations: z.record(z.boolean()), isReconstructable: z.boolean()
+});
+export const lookupTokenSchema = z.string().regex(/^[a-f0-9]{64}$/);
+export const vaultBackupEnvelopeSchema = z.object({
+  lookupToken: lookupTokenSchema, version: z.number().int().positive().max(2147483647),
+  nonce: base64Schema.length(16), ciphertext: base64Schema.max(35 * 1024 * 1024),
+  updatedAt: z.string().datetime()
+});
+export const vaultBackupPutSchema = vaultBackupEnvelopeSchema.extend({
+  fragment7Shard: base64Schema.max(256), writerPublicKey: base64Schema.max(128), signature: base64Schema.max(128),
+  deviceId: deviceIdSchema.optional(), instanceHash: lookupTokenSchema.optional(), deviceSignature: base64Schema.max(128).optional(), claim: z.boolean().default(false)
+});
+export function backupSigningPayload(body: Omit<z.infer<typeof vaultBackupPutSchema>, 'signature'>): Buffer {
+  return Buffer.from(JSON.stringify(['cp-backup-write-v1', body.lookupToken, body.version,
+    body.nonce, body.ciphertext, body.updatedAt, body.fragment7Shard, body.writerPublicKey,
+    body.deviceId ?? null, body.instanceHash ?? null, body.deviceSignature ?? null, body.claim ?? false]));
+}
+
 // Protocol Envelopes
 export const envelopeSchema = z.object({
   version: z.literal(1),

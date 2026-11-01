@@ -28,7 +28,7 @@ export async function addContactAndSession(
   username: string
 ) {
   const db = vault.database();
-  
+
   // 1. Fetch remote user bundle
   const res = await relayClient.request(vault, store, '/api/prekeys/bundle', {
     method: 'POST',
@@ -41,17 +41,17 @@ export async function addContactAndSession(
   }
 
   const bundle = (await res.json()) as any;
-  
+
   const address = ProtocolAddress.new(bundle.recipientUserId, bundle.signalDeviceId);
   await establishSession(store, address, bundle);
 
   const contactId = address.toString();
-  
+
   // Save or update remote_contacts and contacts in local DB
   db.prepare(`
-    INSERT INTO remote_contacts (contact_id, user_id, device_id, signal_device_id) 
+    INSERT INTO remote_contacts (contact_id, user_id, device_id, signal_device_id)
     VALUES (?, ?, ?, ?)
-    ON CONFLICT(contact_id) 
+    ON CONFLICT(contact_id)
     DO UPDATE SET user_id=excluded.user_id, device_id=excluded.device_id, signal_device_id=excluded.signal_device_id
   `).run([contactId, bundle.recipientUserId, bundle.recipientDeviceId, bundle.signalDeviceId]);
 
@@ -60,10 +60,10 @@ export async function addContactAndSession(
   const safetyNumber = await computeSafetyNumber(store, address);
 
   // Update contacts table (username and safety number)
-  db.prepare('UPDATE contacts SET username = ?, safety_number_hash = ?, identity_changed = 0 WHERE contact_id = ?')
-    .run([username, safetyNumber, contactId]);
+  db.prepare('UPDATE contacts SET username = ?, public_uid = ?, safety_number_hash = ?, identity_changed = 0 WHERE contact_id = ?')
+    .run([bundle.recipientUsername ?? username, bundle.publicUid ?? null, safetyNumber, contactId]);
 
-  return { 
+  return {
     conversationId: findOrCreateConversation(db, contactId),
     verified: false,
     safetyNumber
@@ -82,12 +82,12 @@ export async function sendMessage(
 
   // 1. Get destination
   const dest = db.prepare(
-    `SELECT c.contact_id, r.user_id, r.device_id, r.signal_device_id, con.identity_changed
-     FROM conversations c 
-     JOIN remote_contacts r ON r.contact_id = c.contact_id 
+    `SELECT c.contact_id, r.user_id, r.device_id, r.signal_device_id, con.identity_changed, c.disappearing_seconds
+     FROM conversations c
+     JOIN remote_contacts r ON r.contact_id = c.contact_id
      JOIN contacts con ON con.contact_id = c.contact_id
      WHERE c.conversation_id = ?`
-  ).get<{ contact_id: string; user_id: string; device_id: string; signal_device_id: number; identity_changed: number }>([conversationId]);
+  ).get<{ contact_id: string; user_id: string; device_id: string; signal_device_id: number; identity_changed: number; disappearing_seconds: number | null }>([conversationId]);
 
   if (!dest) throw new Error('conversation_not_found');
   if (dest.identity_changed === 1) {
@@ -99,7 +99,8 @@ export async function sendMessage(
   // 2. Build E2EE payload
   const e2eePayload: any = {
     type: 'text',
-    text: plaintext
+    text: plaintext,
+    disappearingSeconds: dest.disappearing_seconds ?? 0
   };
 
   if (attachmentManifest) {
@@ -136,14 +137,14 @@ export async function sendMessage(
 
   // Store sent message locally
   db.prepare(
-    `INSERT INTO messages (message_id, conversation_id, direction, plaintext, sent_at, status) 
-     VALUES (?, ?, 'sent', ?, ?, 'sent')`
-  ).run([messageId, conversationId, plaintext, Date.now()]);
+    `INSERT INTO messages (message_id, conversation_id, direction, plaintext, sent_at, status, disappear_at)
+     VALUES (?, ?, 'sent', ?, ?, 'sent', ?)`
+  ).run([messageId, conversationId, plaintext, Date.now(), dest.disappearing_seconds ? Date.now()+dest.disappearing_seconds*1000 : null]);
 
   // If there's an attachment, save it locally linked to the message
   if (attachmentManifest) {
     const localFileKey = vault.getAttachmentKey();
-    
+
     // Encrypt filename for DB
     const filenameIv = crypto.randomBytes(16);
     const filenameCipher = crypto.createCipheriv('aes-256-cbc', localFileKey, filenameIv);
@@ -172,7 +173,7 @@ export async function syncMessages(
   relayClient: RelayClient
 ): Promise<number> {
   const db = vault.database();
-  
+
   // 1. Fetch pending envelopes from relay
   const res = await relayClient.request(vault, store, '/api/messages/pending');
   if (!res.ok) {
@@ -213,7 +214,7 @@ export async function syncMessages(
 
     // Retrieve sender details
     let contactRow = db.prepare('SELECT contact_id, user_id, signal_device_id FROM remote_contacts WHERE device_id = ?').get<{ contact_id: string; user_id: string; signal_device_id: number }>([envelope.senderId]);
-    
+
     // If not found in remote_contacts, it means a new contact sent us a message!
     // We should fetch their prekey bundle from the relay, establish a session, and create the contact!
     if (!contactRow) {
@@ -233,11 +234,11 @@ export async function syncMessages(
       await establishSession(store, address, bundle);
 
       const contactId = address.toString();
-      
+
       db.prepare(`
-        INSERT INTO remote_contacts (contact_id, user_id, device_id, signal_device_id) 
+        INSERT INTO remote_contacts (contact_id, user_id, device_id, signal_device_id)
         VALUES (?, ?, ?, ?)
-        ON CONFLICT(contact_id) 
+        ON CONFLICT(contact_id)
         DO UPDATE SET user_id=excluded.user_id, device_id=excluded.device_id, signal_device_id=excluded.signal_device_id
       `).run([contactId, bundle.recipientUserId, bundle.recipientDeviceId, bundle.signalDeviceId]);
 
@@ -245,8 +246,8 @@ export async function syncMessages(
       const safetyNumber = await computeSafetyNumber(store, address);
 
       // Save username and safety number in contacts
-      db.prepare('INSERT INTO contacts (contact_id, username, identity_public_key, verified, safety_number_hash, identity_changed, created_at) VALUES (?, ?, ?, 0, ?, 0, ?)')
-        .run([contactId, bundle.recipientUsername, Buffer.from(bundle.identityKey, 'base64'), safetyNumber, Date.now()]);
+      db.prepare('INSERT INTO contacts (contact_id, username, public_uid, identity_public_key, verified, safety_number_hash, identity_changed, created_at) VALUES (?, ?, ?, ?, 0, ?, 0, ?)')
+        .run([contactId, bundle.recipientUsername, bundle.publicUid ?? null, Buffer.from(bundle.identityKey, 'base64'), safetyNumber, Date.now()]);
 
       contactRow = {
         contact_id: contactId,
@@ -276,15 +277,15 @@ export async function syncMessages(
 
         // 3. Store message in messages table
         db.prepare(
-          `INSERT INTO messages (message_id, conversation_id, direction, plaintext, received_at, remote_blob_id, status)
-           VALUES (?, ?, 'received', ?, ?, ?, 'received')`
-        ).run([messageId, conversationId, e2eePayload.text || '', Date.now(), envelope.envelopeId]);
+          `INSERT INTO messages (message_id, conversation_id, direction, plaintext, received_at, remote_blob_id, status, disappear_at)
+           VALUES (?, ?, 'received', ?, ?, ?, 'received', ?)`
+        ).run([messageId, conversationId, e2eePayload.text || '', Date.now(), envelope.envelopeId, [3600,86400,604800].includes(e2eePayload.disappearingSeconds) ? Date.now()+e2eePayload.disappearingSeconds*1000 : null]);
 
         // 4. Save attachment placeholder if any
         if (e2eePayload.attachment) {
           const manifest = e2eePayload.attachment as AttachmentManifest;
           const localFileKey = vault.getAttachmentKey();
-          
+
           // Encrypt original filename for DB
           const filenameIv = crypto.randomBytes(16);
           const filenameCipher = crypto.createCipheriv('aes-256-cbc', localFileKey, filenameIv);
@@ -314,7 +315,7 @@ export async function syncMessages(
         const manifest = e2eePayload.attachment;
         const msgRow = db.prepare('SELECT message_id FROM messages WHERE remote_blob_id = ?').get<{ message_id: string }>([envelope.envelopeId]);
         if (msgRow) {
-          downloadAndDecryptAttachment(vault, store, relayClient, manifest, msgRow.message_id)
+          await downloadAndDecryptAttachment(vault, store, relayClient, manifest, msgRow.message_id)
             .then(() => logger.info({ blobId: manifest.blobId }, 'Attachment download/decrypt completed'))
             .catch(err => logger.error({ err, blobId: manifest.blobId }, 'Attachment download/decrypt failed'));
         }

@@ -3,6 +3,7 @@ import { join, dirname } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import pg from 'pg';
 import { env } from './config.js';
+import { formatPublicUid } from '@crypto-pigeon/protocol';
 import { logger } from './logger.js';
 
 const { Pool } = pg;
@@ -117,6 +118,25 @@ export async function initDb() {
       logger.info('Migration from devices completed successfully');
     }
 
+    await client.query(`CREATE TABLE IF NOT EXISTS vault_backups (
+      lookup_token TEXT PRIMARY KEY CHECK (lookup_token ~ '^[a-f0-9]{64}$'),
+      version INTEGER NOT NULL DEFAULT 1, nonce BYTEA NOT NULL CHECK(octet_length(nonce)=12),
+      ciphertext BYTEA NOT NULL CHECK(octet_length(ciphertext)<=26214400), fragment7_shard BYTEA,
+      writer_public_key BYTEA NOT NULL, signature TEXT NOT NULL, signed_at TEXT NOT NULL,
+      device_id UUID, instance_hash TEXT, device_signature TEXT, claim BOOLEAN NOT NULL DEFAULT false,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+    await client.query(`CREATE TABLE IF NOT EXISTS device_vault_locks (
+      device_id UUID PRIMARY KEY REFERENCES device_identity_keys(device_id), instance_hash TEXT NOT NULL
+    )`);
+    await client.query('ALTER TABLE users ADD COLUMN IF NOT EXISTS public_uid TEXT UNIQUE');
+    const missingUids = await client.query('SELECT user_id FROM users WHERE public_uid IS NULL');
+    for (const row of missingUids.rows) {
+      let uid = formatPublicUid(row.user_id), attempt = 0;
+      while ((await client.query('SELECT 1 FROM users WHERE public_uid=$1',[uid])).rowCount) uid = formatPublicUid(row.user_id+':'+(++attempt));
+      await client.query('UPDATE users SET public_uid=$1 WHERE user_id=$2',[uid,row.user_id]);
+    }
+    await client.query('INSERT INTO schema_migrations(version) VALUES (2) ON CONFLICT DO NOTHING');
     await client.query('INSERT INTO schema_migrations(version) VALUES (1) ON CONFLICT DO NOTHING');
     await client.query('COMMIT');
   } catch (error) {

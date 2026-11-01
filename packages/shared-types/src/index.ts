@@ -48,3 +48,25 @@ export interface ActivationPayload {
 }
 
 export type VaultState = 'locked' | 'unlocked' | 'unconfigured';
+
+export interface HorcruxStatus {
+  sharesPresent: number;
+  totalShares: 7;
+  locations: Record<string, boolean>;
+  isReconstructable: boolean;
+}
+export interface VaultBackupEnvelopeV1 {
+  lookupToken: string;
+  version: number;
+  nonce: string;
+  ciphertext: string;
+  updatedAt: string;
+}
+export interface VaultStatus {
+  vaultState: VaultState;
+  // The secret Vault ID is accepted as input only; never returned or persisted.
+  publicUid?: string;
+  requiresVaultId: boolean;
+}
+export interface PublicAccount { userId: string; username: string; publicUid: string }
+export interface ContactPayload { username: string; publicUid: string }

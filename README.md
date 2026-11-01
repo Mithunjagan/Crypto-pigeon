@@ -1,5 +1,8 @@
 # Crypto Pigeon
 
+For the dual-key vault, encrypted backup/restore, UID follow workflow, responsive
+UI, and Android USB debug client, see [Vault backup and Android](docs/vault-backup-and-android.md).
+
 Crypto Pigeon is an independent, single-device end-to-end encrypted messaging MVP. Each user runs a local daemon that owns the vault and Signal private material; a PostgreSQL-backed relay stores public prekeys and opaque, temporary ciphertext envelopes.
 
 > **Security status:** this is an independent implementation using `@signalapp/libsignal-client` 0.96.4. It is not audited, endorsed by, or equivalent to Signal. Do not rely on it for safety-critical communications without an independent security review and a production deployment review.
