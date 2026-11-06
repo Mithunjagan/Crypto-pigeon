@@ -1,0 +1,73 @@
+plugins { id 'com.android.application' }
+
+// Use the current Tor native executable without the AAR's API-37 Android service.
+// Crypto Pigeon owns the process and foreground lifecycle on API 26-36.
+configurations { torBinary }
+def extractTor = tasks.register('extractTor', Sync) {
+    from { configurations.torBinary.collect { zipTree(it) } }
+    include 'jni/arm64-v8a/libtor.so', 'jni/x86_64/libtor.so'
+    into layout.buildDirectory.dir('generated/tor')
+}
+tasks.named('preBuild').configure { dependsOn extractTor }
+def defaultsFile = rootProject.file('relay-defaults.json')
+def relayDefaults = defaultsFile.exists() ? new groovy.json.JsonSlurper().parse(defaultsFile) : [:]
+def releaseSigningFile = rootProject.file('../../artifacts/keys/release-signing.properties')
+def releaseSigning = new Properties()
+if (releaseSigningFile.exists()) releaseSigningFile.withInputStream { releaseSigning.load(it) }
+android {
+    sourceSets.main.jniLibs.srcDir layout.buildDirectory.dir('generated/tor/jni')
+    namespace 'app.cryptopigeon.nativeclient'
+    compileSdk 36
+    buildFeatures { buildConfig true }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+        coreLibraryDesugaringEnabled true
+    }
+    defaultConfig {
+        applicationId 'app.cryptopigeon.nativeclient'
+        minSdk 26
+        targetSdk 36
+        versionCode 2
+        versionName '0.4.0-standalone'
+        buildConfigField 'String', 'RELAY_URL', '"' + (System.getenv('RELAY_URL') ?: relayDefaults.relayUrl ?: 'http://127.0.0.1:8443').replace('\\','\\\\').replace('"','\\"') + '"'
+        buildConfigField 'String', 'RELAY_DISCOVERY_URL', '"' + (System.getenv('RELAY_DISCOVERY_URL') ?: relayDefaults.discoveryUrl ?: '').replace('\\','\\\\').replace('"','\\"') + '"'
+        testInstrumentationRunner 'app.cryptopigeon.nativeclient.NativeCryptoInstrumentation'
+        ndk { abiFilters 'arm64-v8a', 'x86_64' }
+    }
+    signingConfigs {
+        release {
+            if (releaseSigningFile.exists()) {
+                storeFile new File(releaseSigningFile.parentFile, releaseSigning.getProperty('storeFile'))
+                storePassword releaseSigning.getProperty('storePassword')
+                keyAlias releaseSigning.getProperty('keyAlias')
+                keyPassword releaseSigning.getProperty('keyPassword')
+            }
+        }
+    }
+    buildTypes {
+        debug { applicationIdSuffix '.debug'; debuggable !(project.findProperty('consumerBuild')?.toString() == 'true') }
+        release { minifyEnabled false; debuggable false; signingConfig signingConfigs.release }
+    }
+    packaging {
+        jniLibs { useLegacyPackaging true; excludes += ['**/libsignal_jni_testing.so'] }
+        resources {
+            excludes += ['libsignal_jni*.dylib','signal_jni*.dll','libsignal_jni*.dll','libsignal_jni*.so','META-INF/versions/**']
+            merges += ['META-INF/LICENSE*','META-INF/NOTICE*']
+        }
+    }
+}
+dependencies {
+    implementation 'androidx.core:core:1.17.0'
+    torBinary 'info.guardianproject:tor-android:0.4.9.14@aar'
+    implementation 'info.guardianproject:jtorctl:0.4.5.7'
+    implementation 'com.squareup.okhttp3:okhttp:4.12.0'
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+    implementation 'org.signal:libsignal-client:0.96.4'
+    implementation 'org.signal:libsignal-android:0.96.4'
+    implementation 'net.zetetic:sqlcipher-android:4.20.0@aar'
+    implementation 'androidx.sqlite:sqlite:2.5.2'
+    implementation 'org.bouncycastle:bcprov-jdk18on:1.86'
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+}

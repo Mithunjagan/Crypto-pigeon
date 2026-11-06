@@ -1,0 +1,17 @@
+{
+  email {$TLS_EMAIL}
+  admin off
+}
+
+{$RELAY_DOMAIN} {
+  # No access log: do not retain contact IP addresses in proxy logs.
+  header {
+    Strict-Transport-Security "max-age=31536000"
+    X-Content-Type-Options nosniff
+    Referrer-Policy no-referrer
+    -Server
+  }
+  @admin path /admin /admin/* /api/admin /api/admin/*
+  respond @admin 404
+  reverse_proxy relay:8443
+}

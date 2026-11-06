@@ -1,0 +1,833 @@
+Crypto Pigeon — E2EE Messaging Application Restructure (Final v3)
+
+Scope Statement
+
+Crypto Pigeon uses libsignal-based end-to-end encryption with PQXDH-compatible session establishment. It is an independent implementation and has not been audited or endorsed by Signal.
+
+This plan does not claim Signal-equivalent privacy, complete metadata anonymity, protection against endpoint compromise, unbreakable encryption, or perfect forward secrecy against all adversary classes.
+
+The relay processes network and routing metadata during active connections but is designed not to persist it in application logs. Infrastructure-level logging by reverse proxies, hosting providers, and operating systems may still occur and must be separately configured.
+
+Device Model
+
+This MVP is strictly single-device per user account. One active device per user. Activating a replacement device revokes the previous device. Contacts receive an identity-change warning. No historical messages are transferred. No message fanout, no linked-device key verification, no per-device delivery accounting.
+
+True multi-device support would require separate Signal sessions per recipient device, one encrypted envelope per device, separate prekey bundles per device, attachment download accounting per device, delivery state aggregation, and linked-device key verification. None of that is in scope.
+
+Post-Quantum Ratchet Status
+
+The exact post-quantum ratchet behavior of libsignal 0.96.4 will be determined through inspection of the pinned API, upstream implementation, and interoperability tests. The SignalMessage structure in 0.96.4 contains a pqRatchet field, but the public TypeScript API does not expose obvious exports named SPQR or Triple Ratchet. Crypto Pigeon will not claim continuous post-quantum security unless that behavior is verified. Version pinning is maintained because Signal explicitly states outside use is unsupported and APIs may change.
+
+Key Separation Architecture
+
+Four distinct key domains. No key is ever reused across domains.
+
+┌─────────────────────────────────────────────────────┐
+│  1. VAULT MASTER KEY HIERARCHY                      │
+│     password (≥12 chars, reject common/breached)    │
+│       ↓ Argon2id(passphrase, argon2_salt,           │
+│         memoryCost=65536KiB†, timeCost=3†,          │
+│         parallelism=1†)                             │
+│     Key Encryption Key (KEK, 256-bit)               │
+│       ↓ AES-256-GCM-unwrap(KEK, wrapped_vmk,       │
+│         nonce, aad="vmk-wrap-v1")                   │
+│     Vault Master Key (VMK, 256-bit random)          │
+│       ↓ HKDF(VMK, hkdf_salt‡, context)             │
+│     ├── sqlcipher_key        "sqlcipher-key-v1"     │
+│     ├── field_encryption_key "field-aead-v1"        │
+│     ├── attachment_meta_key  "attachment-meta-v1"   │
+│     └── local_token_key     "local-token-v1"        │
+│                                                     │
+│  † Baseline minimum. Calibrate at first setup for   │
+│    approximately 300–750ms on the machine.           │
+│  ‡ hkdf_salt is a separate random salt, NOT the     │
+│    same as the Argon2 password salt.                 │
+│  Password change: re-wrap VMK with new KEK.         │
+│  No bulk re-encryption of records required.          │
+├─────────────────────────────────────────────────────┤
+│  2. SIGNAL IDENTITY KEYS (libsignal only)           │
+│     libsignal IdentityKeyPair                       │
+│     Serialized/deserialized only through libsignal. │
+│     Treated as opaque. Never manually labeled as    │
+│     raw X25519/Ed25519. Never converted into        │
+│     device-auth keys.                               │
+│     + signed prekey pairs                           │
+│     + one-time prekeys (classical)                  │
+│     + Kyber prekeys (ML-KEM, post-quantum)          │
+│                                                     │
+│  NEVER used for: relay auth, API auth, admin,       │
+│  generic signing, token generation.                 │
+├─────────────────────────────────────────────────────┤
+│  3. DEVICE AUTH SIGNING KEY (relay authentication)  │
+│     Ed25519 keypair via Node crypto.generateKeyPair │
+│     Used ONLY for relay challenge-response.         │
+│     Completely separate from Signal Protocol.       │
+├─────────────────────────────────────────────────────┤
+│  4. ATTACHMENT KEYS (per-attachment, ephemeral)     │
+│     Random AES-256-GCM key per attachment.          │
+│     Carried ONLY inside Signal-encrypted payload.   │
+│     NEVER sent to relay in cleartext.               │
+└─────────────────────────────────────────────────────┘
+
+Relay Envelope Format
+
+interface RelayEnvelopeV1 {
+  version: 1;
+  envelopeId: string;     // 128-bit cryptographically random (NOT UUIDv7)
+  mailboxId: string;      // opaque recipient routing capability
+  ciphertext: Uint8Array; // opaque sealed payload — indivisible bytes
+}
+
+Relay applies its own queue TTL from server receipt time. No client-supplied expiry in the outer envelope. All message metadata (sender, type, timer, filename, etc.) inside E2EE payload only.
+
+Prekey Infrastructure (Relay Side — Complete)
+
+Device Registration Table
+
+CREATE TABLE device_identity_keys (
+  device_id            UUID PRIMARY KEY,
+  user_id              UUID NOT NULL REFERENCES users(user_id),
+  identity_public_key  BYTEA NOT NULL,    -- opaque libsignal serialized public key
+  auth_public_key      BYTEA NOT NULL,    -- separate Ed25519 device-auth key
+  registration_id      INTEGER NOT NULL,  -- required by PreKeyBundle.new()
+  signal_device_id     INTEGER NOT NULL,  -- numeric Signal device ID for ProtocolAddress
+  registered_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  revoked_at           TIMESTAMPTZ,
+  UNIQUE(user_id)  -- single-device MVP: one active device per user
+);
+
+Signed Prekeys
+
+CREATE TABLE signed_prekeys (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  device_id        UUID NOT NULL REFERENCES device_identity_keys(device_id),
+  signal_prekey_id INTEGER NOT NULL,
+  public_key       BYTEA NOT NULL,
+  signature        BYTEA NOT NULL,
+  uploaded_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at       TIMESTAMPTZ,
+  UNIQUE(device_id, signal_prekey_id)
+);
+
+Classical One-Time Prekeys
+
+CREATE TABLE one_time_prekeys (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  device_id        UUID NOT NULL REFERENCES device_identity_keys(device_id),
+  signal_prekey_id INTEGER NOT NULL,
+  public_key       BYTEA NOT NULL,
+  consumed         BOOLEAN NOT NULL DEFAULT false,
+  consumed_at      TIMESTAMPTZ,
+  uploaded_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(device_id, signal_prekey_id)
+);
+
+Post-Quantum One-Time Prekeys (Kyber/ML-KEM)
+
+CREATE TABLE pq_one_time_prekeys (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  device_id        UUID NOT NULL REFERENCES device_identity_keys(device_id),
+  signal_prekey_id INTEGER NOT NULL,
+  public_key       BYTEA NOT NULL,
+  signature        BYTEA NOT NULL,     -- KyberPreKeyRecord includes signature
+  prekey_type      TEXT NOT NULL CHECK (prekey_type IN ('one_time', 'last_resort')),
+  consumed         BOOLEAN NOT NULL DEFAULT false,
+  consumed_at      TIMESTAMPTZ,
+  uploaded_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE(device_id, signal_prekey_id)
+);
+
+Key Version Tracking (Operational, Not Security Authority)
+
+CREATE TABLE device_key_versions (
+  device_id   UUID NOT NULL REFERENCES device_identity_keys(device_id),
+  key_type    TEXT NOT NULL,    -- 'identity', 'signed_prekey'
+  version     INTEGER NOT NULL,
+  fingerprint BYTEA NOT NULL,
+  changed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY(device_id, key_type, version)
+);
+
+IMPORTANT: The device_key_versions table is retained for operational history but is NOT a security authority. A malicious relay controls that table and can replace both the identity key and version information. Authoritative identity-change detection happens exclusively in the local daemon via TOFU pinning (see Identity Pinning section below).
+
+Prekey Routes
+
+POST /api/prekeys/signed             Upload/rotate signed prekey
+POST /api/prekeys/one-time           Upload batch of classical one-time prekeys
+POST /api/prekeys/pq-one-time        Upload batch of PQ one-time prekeys (with signatures)
+POST /api/prekeys/bundle             Fetch bundle (POST because it consumes state)
+GET  /api/prekeys/count              Return remaining prekey inventory counts
+POST /api/prekeys/cleanup            Remove expired signed prekeys (admin/cron)
+
+Bundle Consumption (POST /api/prekeys/bundle)
+
+POST, not GET — this operation mutates state by consuming one-time prekeys. GET would allow caches, crawlers, and retries to consume prekeys.
+
+BEGIN;
+  -- Lock and consume one classical one-time prekey
+  UPDATE one_time_prekeys
+    SET consumed = true, consumed_at = now()
+    WHERE id = (
+      SELECT id FROM one_time_prekeys
+      WHERE device_id = $1 AND consumed = false
+      ORDER BY uploaded_at ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING signal_prekey_id, public_key;
+
+  -- Lock and consume one PQ one-time prekey
+  UPDATE pq_one_time_prekeys
+    SET consumed = true, consumed_at = now()
+    WHERE id = (
+      SELECT id FROM pq_one_time_prekeys
+      WHERE device_id = $1 AND consumed = false AND prekey_type = 'one_time'
+      ORDER BY uploaded_at ASC
+      LIMIT 1
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING signal_prekey_id, public_key, signature;
+COMMIT;
+
+Fallback when inventory empty:
+
+- Classical one-time prekey: may be absent (libsignal PreKeyBundle allows preKeyId to be null)
+- PQ one-time prekey: fall back to signed last-resort Kyber prekey (prekey_type = 'last_resort'), which is NOT consumed
+- Trigger immediate replenishment warning to the device owner (via WebSocket notification or next poll)
+
+Activation Payload (Corrected)
+
+interface ActivationPayload {
+  requestId: string;
+  activationCode: string;
+  deviceAuthPublicKey: Uint8Array;          // Ed25519, for relay challenge-response
+  signalIdentityPublicKey: Uint8Array;      // opaque libsignal serialized key
+  registrationId: number;                   // required by PreKeyBundle.new()
+  signalDeviceId: number;                   // numeric Signal device ID
+  signedPrekey: {
+    id: number;
+    publicKey: Uint8Array;
+    signature: Uint8Array;
+  };
+  oneTimePrekeys: Array<{
+    id: number;
+    publicKey: Uint8Array;
+  }>;
+  pqOneTimePrekeys: Array<{
+    id: number;
+    publicKey: Uint8Array;
+    signature: Uint8Array;                  // KyberPreKeyRecord signature
+  }>;
+  pqLastResortPrekey: {                     // signed last-resort Kyber prekey
+    id: number;
+    publicKey: Uint8Array;
+    signature: Uint8Array;
+  };
+}
+
+Identity Pinning (Client-Side TOFU)
+
+Identity-change detection is authoritative only in the local daemon, not the relay.
+
+First contact with User B:
+  → fetch bundle from relay
+  → store User B's identity public key locally (Trust On First Use)
+  → display safety number for optional out-of-band verification
+
+Subsequent bundle fetches for User B:
+  → compare returned identity key against locally pinned key
+  → IF different:
+      → reject automatic session replacement
+      → mark contact as identity_changed
+      → display BLOCKING warning in UI
+      → require explicit user approval before proceeding
+      → update safety number display
+
+Limitation:
+  A first-contact relay substitution (MITM at initial bundle fetch)
+  cannot be detected without out-of-band safety-number verification.
+  This is inherent to TOFU and is documented as a known limitation.
+
+Challenge-Response Relay Authentication
+
+Uses device_auth_signing_key (Ed25519 via Node crypto). Never uses Signal identity key.
+
+Client                              Relay
+  │                                   │
+  ├── POST /api/auth/challenge ──────►│
+  │   { deviceId }                    │
+  │                                   │
+  │◄── { challenge, expiresAt } ──────┤  256-bit random, ~60s validity
+  │                                   │  bound to deviceId, single-use
+  │                                   │
+  ├── POST /api/auth/respond ────────►│
+  │   { deviceId, challenge,          │
+  │     signature, relayHostname }    │  Ed25519.sign(deviceId || challenge
+  │                                   │    || relayHostname, device_auth_key)
+  │                                   │
+  │◄── { sessionToken, expiresAt } ───┤  verify against registered
+  │                                   │  auth_public_key, consume challenge
+
+Localhost Bootstrap Authentication
+
+Single origin. UI and API from same http://127.0.0.1:<random-port>/.
+
+Startup Flow
+
+1. Daemon binds to 127.0.0.1 on random available port
+2. Generate one-time 256-bit bootstrap secret
+3. Terminal prints: "Open: http://127.0.0.1:PORT/bootstrap#SECRET"
+4. Browser JS reads fragment, POSTs { secret } to /api/bootstrap
+5. Server verifies, atomically invalidates bootstrap secret
+6. Server sets HttpOnly, SameSite=Strict, Path=/ session cookie
+7. Server returns CSRF token in response body (JS memory only)
+8. Bootstrap secret permanently expired
+
+CSRF Token Refresh After Page Reload
+
+After page reload, the in-memory CSRF token is lost. Provide:
+
+GET /api/session
+  Requires: valid session cookie
+  Returns: { csrfToken, vaultState }
+  Purpose: re-establish CSRF token after page reload
+
+Session Invalidation
+
+The local session cookie and all associated state are invalidated when:
+
+- Vault locks (inactivity timeout or explicit lock)
+- Vault unlocks again (new session required)
+- Daemon restarts
+- User explicitly logs out
+
+This prevents a browser tab holding an old cookie from regaining access after vault re-open. Each unlock cycle generates a new session generation/version number; the session cookie is bound to that generation.
+
+WebSocket Handshake Validation
+
+Every WebSocket upgrade must validate:
+
+1. Session cookie (valid and current generation)
+2. Origin header (http://127.0.0.1:PORT only)
+3. Host header (127.0.0.1:PORT only)
+4. Vault unlocked state
+5. Session generation matches
+
+Security Headers
+
+Content-Security-Policy:
+  default-src 'none'; script-src 'self'; style-src 'self';
+  connect-src 'self'; img-src 'self' blob:; media-src 'self' blob:;
+  font-src 'self'; frame-ancestors 'none'; form-action 'self'; base-uri 'none'
+X-Content-Type-Options: nosniff
+X-Frame-Options: DENY
+Referrer-Policy: no-referrer
+Cache-Control: no-store, no-cache, must-revalidate
+Permissions-Policy: microphone=(self), camera=(), geolocation=(), payment=()
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Resource-Policy: same-origin
+
+Attachment Encryption (Deterministic Design)
+
+Nonce Strategy (Fixed Decision)
+
+Random 12-byte nonce per chunk. Stored alongside each encrypted chunk. At 25MB limit with 64KB chunks (~400 chunks max), random 96-bit nonces have negligible collision probability under a single attachment key.
+
+Per-Attachment Flow
+
+1. Generate random attachment key: crypto.randomBytes(32) → AES-256-GCM
+2. Chunk plaintext into 64KB blocks
+3. For each chunk:
+   - Generate random 12-byte nonce: crypto.randomBytes(12)
+   - AEAD additional data: attachmentId || chunkIndex || totalChunkCount || protocolVersion
+   - Encrypt chunk with AES-256-GCM(attachment_key, nonce, plaintext, aad)
+   - Store: { encryptedData, nonce, chunkIndex }
+4. Compute full-file SHA-256 digest over complete plaintext
+5. Upload encrypted chunks to relay with high-entropy blob ID (128-bit random)
+6. Finalize upload transaction on relay
+
+Authenticated Manifest (Inside Signal E2EE Payload)
+
+interface AttachmentManifest {
+  attachmentId: string;          // 128-bit random
+  blobId: string;                // relay blob capability
+  originalFilename: string;      // sanitized
+  claimedMimeType: string;       // NOT trusted for rendering
+  totalPlaintextSize: number;
+  chunkCount: number;
+  chunkSize: number;             // 65536
+  chunkNonces: string[];         // base64-encoded per-chunk nonces
+  fullFileDigest: string;        // SHA-256 hex of full plaintext
+  attachmentKey: string;         // base64 AES-256-GCM key
+  encryptionVersion: 1;
+}
+
+Download Verification
+
+1. Receive manifest from decrypted Signal message
+2. Download encrypted chunks using blobId (requires session auth)
+3. Decrypt each chunk with manifest's attachment key + stored nonce
+4. Verify AEAD tag (implicit in GCM decrypt)
+5. Verify chunk count matches manifest
+6. Reject duplicate or reordered chunk indices
+7. Reassemble plaintext
+8. Compute SHA-256 over reassembled plaintext
+9. Compare against manifest digest using timing-safe comparison
+10. Reject on any mismatch
+11. Sanitize filename: strip path separators, control chars, null bytes, limit length
+12. Render using blob: URLs; never trust claimedMimeType for execution
+
+Single-Device Blob Deletion
+
+download all chunks
+  → decrypt each chunk
+  → verify AEAD tags
+  → verify full-file digest (timing-safe)
+  → store decrypted attachment durably in vault
+  → send blob acknowledgment to relay
+  → relay deletes blob
+
+One device per user means no multi-device download accounting needed.
+
+Disappearing Messages
+
+Property: Disappearing messages perform best-effort logical deletion from compliant Crypto Pigeon clients. They do not prevent screenshots, screen recording, text copying, client modification, database backup, or physical data recovery from storage media.
+
+Semantics
+
+- Sender copy timer starts relative to send time
+- Recipient copy timer starts relative to first display/read
+- Timer changes are E2EE control messages (inside encrypted payload)
+- Relay queue TTL is independent (server receipt time)
+- Attachment deletion follows local message deletion
+- Read receipts are optional and E2EE (not relay metadata)
+
+Timer Values
+
+off | 30s | 5m | 1h | 1d | 1w
+
+Timer Updates
+
+A timer update is an encrypted conversation-control message. Each compliant client applies the latest valid timer update from the point it is received. Neither party can cryptographically force deletion on the other endpoint.
+
+Use a monotonically increasing conversation-control sequence number to prevent old timer updates from overriding newer ones. If a received sequence number is ≤ the current local sequence number, the update is ignored.
+
+Delivery Acknowledgment Sequence
+
+Ack happens only after durable local storage.
+
+receive envelope over WebSocket
+  → validate envelope bounds and version
+  → deduplicate against local seen_envelope_ids
+  → decrypt ciphertext via Signal adapter
+  → BEGIN TRANSACTION (SQLite/SQLCipher WAL mode, PRAGMA synchronous = FULL)
+      → store decrypted message in vault
+      → store updated Signal session/ratchet state
+      → store envelope ID in deduplication table
+    COMMIT
+  → send delivery acknowledgment to relay
+  → relay deletes queued envelope
+
+No per-message WAL checkpoint. PRAGMA synchronous = FULL ensures durability at transaction commit. Periodic checkpoints occur naturally or can be triggered at intervals (e.g., every 60 seconds).
+
+Delivery States
+
+State              Meaning
+relay_accepted     Relay received and queued the envelope
+delivered          Recipient vault durably stored the decrypted message
+displayed          Recipient UI rendered the message (starts disappear timer)
+
+Read receipts are encrypted messages, not relay metadata.
+
+Activation Code Design
+
+Properties
+
+- 128 bits of entropy: crypto.randomBytes(16) → base32 encoding
+- Expiration: 10 minutes (configurable)
+- Single use: atomically consumed
+- Attempt limits: 5 attempts per request ID, then locked
+- Bound to device: activation binds code to submitted device public keys
+- Server-side storage: HMAC-SHA256(pepper[version], activation_code)
+  - Server pepper loaded from environment
+  - Pepper version stored alongside HMAC: pepper_version INTEGER NOT NULL
+  - Current and previous pepper retained until all codes under previous version have expired
+  - With 128-bit random codes and 10-minute lifetime, frequent pepper rotation provides little practical benefit; stable deployment secret with planned operational rotation is sufficient
+- No plaintext storage, logs, URLs
+- CLI history warning: administrator informed that code appears in terminal output
+
+Activation Payload
+
+See "Activation Payload (Corrected)" in Prekey Infrastructure section above.
+
+Vault Key Hierarchy
+
+User passphrase (≥12 chars, reject common/breached)
+    │
+    ▼ Argon2id(passphrase, argon2_salt,
+    │          memoryCost†, timeCost†, parallelism†)
+    │
+Key Encryption Key (KEK, 256-bit)
+    │
+    ▼ AES-256-GCM-unwrap(KEK, wrapped_vmk, nonce, aad="vmk-wrap-v1")
+    │
+Vault Master Key (VMK, 256-bit random, generated once)
+    │  (separate hkdf_salt, NOT argon2_salt)
+    │
+    ├─ HKDF(VMK, hkdf_salt, "sqlcipher-key-v1")    → SQLCipher key
+    ├─ HKDF(VMK, hkdf_salt, "field-aead-v1")       → field AEAD key
+    ├─ HKDF(VMK, hkdf_salt, "attachment-meta-v1")   → attachment metadata key
+    └─ HKDF(VMK, hkdf_salt, "local-token-v1")       → local session token key
+
+Password Policy
+
+- Minimum 12 characters
+- Reject common or breached passwords (bundled top-10k list check)
+- Encourage password-manager-generated passphrases in UI
+- Calibrate Argon2id at first vault creation for approximately 300–750ms on the machine
+- 64 MiB memory, 3 iterations, parallelism 1 as minimum baseline, not absolute
+- Separate random HKDF derivation salt from Argon2 password salt
+
+Stored on Disk (config.json)
+
+{
+  "version": 2,
+  "kdfParams": {
+    "algorithm": "argon2id",
+    "memoryCost": 65536,
+    "timeCost": 3,
+    "parallelism": 1,
+    "argon2Salt": "<base64>"
+  },
+  "wrappedVmk": "<base64 AES-256-GCM encrypted VMK>",
+  "vmkNonce": "<base64 12-byte nonce>",
+  "hkdfSalt": "<base64 separate salt>",
+  "vmkVersion": 1,
+  "createdAt": "ISO8601"
+}
+
+Platform Security
+
+- Windows: icacls on vault directory, restrict to current user
+- Linux: chmod 700 directory, chmod 600 files
+- Best-effort buffer.fill(0) for key material
+- Corruption recovery: offer re-creation (no history recovery possible)
+
+Metadata Privacy (Honest)
+
+Relay sees during active connections
+
+Metadata                            Visible?
+Connecting IP address               Yes (network layer)
+Connection timestamps               Yes
+Destination mailbox ID              Yes (routing)
+Encrypted message size              Yes (network layer)
+Online/offline status               Yes (WebSocket presence)
+Queue activity patterns             Yes
+Username (during lookup)            Yes (rate-limited)
+Conversation-request relationships  Yes
+Attachment size and upload timing   Yes
+
+Relay does NOT see
+
+Data                                Protected by
+Message plaintext                   Signal Protocol E2EE
+Sender identity (in envelope)       Inside ciphertext only
+Attachment contents                 Per-attachment AES-256-GCM
+Attachment filename, MIME type      Inside E2EE payload
+Disappearing timer values           Inside E2EE payload
+Private keys                        Never leave daemon
+
+Application does NOT persist
+
+- IP addresses not stored in database or logs
+- HTTP/WebSocket access logs disabled
+- No analytics, telemetry, fingerprinting, third-party scripts
+
+Honest caveats
+
+- Infrastructure may log connection metadata separately
+- Tor is optional, not mandatory; does not constitute anonymity guarantee
+- Sealed-sender delivery not implemented in this MVP
+- Traffic analysis possible for network-level adversary
+- Sender authenticates to WebSocket before sending — sender info in ciphertext alone does not achieve sealed-sender
+
+Repository Structure
+
+crypto_pigeon/
+├── apps/
+│   ├── local-daemon/          # Replaces apps/client/
+│   │   ├── src/
+│   │   │   ├── server.ts
+│   │   │   ├── vault.ts
+│   │   │   ├── vault-keys.ts     # KEK → VMK → HKDF derived keys
+│   │   │   ├── signal-store.ts
+│   │   │   ├── signal-adapter.ts # ALL libsignal calls wrapped here
+│   │   │   ├── messages.ts
+│   │   │   ├── attachments.ts
+│   │   │   ├── voice-notes.ts
+│   │   │   ├── relay-client.ts   # HTTP + WS + challenge-response
+│   │   │   ├── disappearing.ts
+│   │   │   ├── fingerprint.ts
+│   │   │   ├── logger.ts         # Redacting structured logger
+│   │   │   ├── config.ts
+│   │   │   ├── auth.ts           # Bootstrap, CSRF, Origin, Host, sessions
+│   │   │   ├── security.ts      # CSP, headers, DNS rebinding
+│   │   │   └── types.ts
+│   │   ├── test/
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   │
+│   ├── local-ui/              # React + Vite browser UI
+│   │   ├── src/
+│   │   │   ├── main.tsx, App.tsx, api.ts
+│   │   │   ├── components/    # 18 components (see spec)
+│   │   │   ├── hooks/         # useAuth, useWebSocket, useMediaRecorder
+│   │   │   └── styles/        # index.css (dark terminal theme)
+│   │   ├── index.html, vite.config.ts
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   │
+│   ├── relay-server/          # Replaces apps/relay/
+│   │   ├── src/
+│   │   │   ├── server.ts, schema.sql, db.ts
+│   │   │   ├── ws-handler.ts
+│   │   │   ├── auth.ts        # Challenge-response (device-auth key only)
+│   │   │   ├── prekeys.ts     # Complete lifecycle
+│   │   │   ├── logger.ts, config.ts
+│   │   │   ├── rate-limit.ts  # Privacy-preserving
+│   │   │   ├── queue.ts       # Persistent + TTL
+│   │   │   ├── attachments.ts # Blob storage
+│   │   │   └── types.ts
+│   │   ├── test/
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   │
+│   └── admin-cli/
+│       ├── src/index.ts
+│       ├── package.json
+│       └── tsconfig.json
+│
+├── packages/
+│   ├── protocol/              # Envelope, schemas, constants
+│   │   ├── src/
+│   │   ├── package.json
+│   │   └── tsconfig.json
+│   └── shared-types/          # Shared TypeScript interfaces
+│       ├── src/
+│       ├── package.json
+│       └── tsconfig.json
+│
+├── tests/e2e/                 # End-to-end integration test
+├── docs/                      # architecture, threat-model, security-properties,
+│                              # deployment, protocol-flow
+├── .env.example, .gitignore
+├── docker-compose.yml, Dockerfile
+├── package.json, package-lock.json
+└── README.md
+
+Legacy Cleanup
+
+Deleted
+
+- apps/client/ — entire directory (UI, src, dist, ui-dist)
+- apps/relay/ — entire directory (replaced by relay-server)
+- *.err.log, *.out.log — stale log files
+
+Preserved (modified)
+
+- Root package.json, package-lock.json, docker-compose.yml, Dockerfile
+- .env, .env.example, .gitignore
+
+Implementation Phases
+
+Phase 0: Threat Model and Security Properties
+
+- docs/threat-model.md — governs all design decisions
+- docs/security-properties.md — honest claims and limitations
+- No code produced; all subsequent phases reference this document
+
+Phase 1: Protocol Specification
+
+- packages/protocol/ — envelope format, Zod schemas, constants
+- packages/shared-types/ — TypeScript interfaces
+- All state machines defined (vault, access, conversation, delivery)
+
+Phase 2: Relay Server
+
+- PostgreSQL schema with all prekey tables
+- Challenge-response auth (device-auth key only)
+- Persistent message queue with server-side TTL
+- WebSocket handler (real-time + offline queue fallback)
+- Prekey lifecycle: upload, POST-based atomic consumption, inventory, rotation, last-resort fallback, replenishment warning
+- Privacy-preserving rate limiting
+- Attachment blob storage
+- Redacting logger
+
+Phase 3: Local Vault and Signal Integration
+
+- Vault key hierarchy (KEK → VMK → HKDF-derived keys)
+- SQLCipher + field-level AEAD
+- Signal stores backed by vault (opaque libsignal types)
+- Signal adapter wrapping all libsignal calls
+- Separate device-auth Ed25519 keypair
+- Client-side TOFU identity pinning
+- Fingerprint/safety number generation
+- Per-conversation ratchet serialization
+- Password policy with common-password rejection
+- Platform file permissions
+
+Phase 4: Messaging
+
+- Encrypt/decrypt via signal-adapter
+- Durable-storage-first ack sequence (PRAGMA synchronous=FULL)
+- Delivery states, read receipts as E2EE messages
+- Deduplication, envelope validation
+
+Phase 5: Attachments, Voice Notes, Disappearing Messages
+
+- Random 12-byte nonce per chunk
+- Authenticated manifest inside E2EE payload
+- Timing-safe digest comparison
+- Single-device blob deletion flow
+- Voice notes as attachments
+- Disappearing timer control messages with monotonic sequence numbers
+
+Phase 6: Browser UI
+
+- React + Vite, all 18 components
+- Dark terminal theme, local fonts only
+- Bootstrap secret → HttpOnly cookie → CSRF in memory
+- GET /api/session for CSRF refresh after reload
+- Session invalidation on vault lock/unlock/restart
+- Strict CSP, microphone=(self), camera=()
+
+Phase 7: Admin CLI
+
+- Existing commands enhanced
+- Output formatting, connection validation
+
+Phase 8: Testing and Documentation
+
+- 54 test cases (see below)
+- E2E integration test
+- Canary-based log verification (not WAL inspection claims)
+- Complete documentation
+- AGPL compliance note
+- Dependency audit
+
+Test Suite (54 Tests)
+
+#   Test                                                    Category
+1   Two users request and receive approval                  Access
+2   Activation codes expire                                 Access
+3   Activation codes single-use                             Access
+4   Activation codes stored as HMAC with pepper, never plaintext  Access
+5   Unapproved user cannot activate                         Access
+6   Rejected user cannot activate                           Access
+7   Activation attempt limit enforced                       Access
+8   Conversation request sent                               Conversation
+9   Acceptance required before session                      Conversation
+10  Text message E2EE round-trip                            Messaging
+11  Canary plaintext absent from relay DB columns           Messaging
+12  Relay cannot decrypt captured envelope                  Messaging
+13  Modified ciphertext fails auth                          Messaging
+14  Duplicate envelopes suppressed                          Messaging
+15  Replayed messages rejected                              Messaging
+16  Image transfer E2EE                                     Attachments
+17  Voice note transfer E2EE                                Attachments
+18  Tampered chunk AEAD fails                               Attachments
+19  Reordered chunks detected                               Attachments
+20  Partial upload cleaned                                  Attachments
+21  Expired queue entries deleted                           Queue
+22  Ack deletes from queue                                  Queue
+23  Ack only after durable commit                           Queue
+24  Disappearing messages deleted after timer               Disappearing
+25  New device gets no old history                          Identity
+26  Identity key change → blocking warning                  Identity
+27  Prekey exhaustion → replenishment                       Prekeys
+28  Signed prekey rotation                                  Prekeys
+29  Atomic one-time prekey consumption (no double-use)      Prekeys
+30  Identity substitution detected by TOFU                  Prekeys
+31  Concurrent messages don't corrupt ratchet               Ratchet
+32  Out-of-order Signal messages handled                    Ratchet
+33  Skipped message keys handled                            Ratchet
+34  Daemon crash during ratchet tx → safe recovery          Ratchet
+35  Crash after receive, before ack → re-delivery           Delivery
+36  Vault unreadable without passphrase                     Vault
+37  Wrong passphrase fails safely                           Vault
+38  Password change re-wraps VMK                            Vault
+39  Invalid Origin rejected                                 LocalAPI
+40  Missing session token → 401                             LocalAPI
+41  Invalid Host → rejected (DNS rebinding)                 LocalAPI
+42  Bootstrap secret single-use                             LocalAPI
+43  GET /api/session refreshes CSRF after reload            LocalAPI
+44  Session invalidated on vault lock                       LocalAPI
+45  Canary values absent from all logs                      Logging
+46  Oversized WebSocket frames rejected                     Transport
+47  Malformed JSON rejected by schema                       Validation
+48  Challenge-response uses device-auth key, not identity key  Auth
+49  Challenge expires after ~60s                            Auth
+50  Challenge single-use                                    Auth
+51  Path traversal in attachment filename prevented         Attachments
+52  Symlink attack on vault directory prevented             Vault
+53  WebSocket reconnect with backoff                        Transport
+54  All production builds complete                          Build
+
+Canary-Based Verification (Replaces WAL Inspection Claims)
+
+Insert unique canary plaintext strings into messages. After relay processing, scan:
+
+- Relay database columns (SELECT across all tables)
+- Relay application logs
+- Docker container logs
+- Temporary files in relay working directory
+- Error/crash output captured during test
+
+This does not prove absolute absence of plaintext leakage but is a meaningful, reproducible test.
+
+Verification Plan
+
+Automated
+
+npm install
+npm run build
+npm run typecheck
+npm run lint
+npm run test
+npm run test:e2e
+npm audit
+
+Security Checklist
+
+[ ] Signal identity key never used for relay auth
+[ ] Device-auth Ed25519 key used exclusively for challenge-response
+[ ] Canary plaintext absent from relay DB and logs
+[ ] No private keys exposed to browser
+[ ] No IP addresses in application logs or database
+[ ] Activation codes stored as HMAC with versioned pepper
+[ ] Vault locked after inactivity; session invalidated
+[ ] Origin/Host validation rejects non-localhost
+[ ] Bootstrap secret single-use and expired
+[ ] GET /api/session provides CSRF refresh
+[ ] Key change produces blocking warning (TOFU)
+[ ] Expired messages deleted from vault
+[ ] Ack only after durable commit (PRAGMA synchronous=FULL)
+[ ] Random envelope IDs (no UUIDv7 timestamps)
+[ ] POST for prekey bundle consumption
+[ ] PQ prekeys include signatures
+[ ] Last-resort Kyber prekey fallback works
+[ ] Permissions-Policy: microphone=(self), camera=()
+[ ] Single-device model enforced (UNIQUE user_id on device)
+[ ] AGPL-3.0 compliance documented
+
+Known Limitations (Pre-documented)
+
+1. Not Signal-equivalent — independent, unaudited implementation
+2. No sealed-sender delivery
+3. No continuous post-quantum forward secrecy (unless libsignal 0.96.4 provides it)
+4. TOFU vulnerable to first-contact MITM without OOB verification
+5. Metadata visible to relay during connections
+6. Single-device only — no multi-device
+7. Disappearing messages are best-effort logical deletion
+8. AGPL-3.0 licensing obligations apply

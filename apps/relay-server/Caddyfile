@@ -1,0 +1,3 @@
+{$PUBLIC_RELAY_URL} {
+    reverse_proxy relay:{$PORT}
+}

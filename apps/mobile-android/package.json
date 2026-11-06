@@ -1,0 +1,5 @@
+{
+  "name": "@crypto-pigeon/mobile-android",
+  "private": true,
+  "scripts": { "build": "node ../../scripts/android-build.mjs --assets-only" }
+}

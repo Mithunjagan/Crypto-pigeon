@@ -1,0 +1,15 @@
+# Current Gemini handoff — 6 November 2026
+
+Continue from the existing Windows project D:\Crypto pigeon main\Crypto-pigeon-master. The original three-phase task is COMPLETE: desktop and one-physical-Android-phone/laptop Node daemon tests passed over real public Tor v3 onions. Do not treat the old morning charging pause or earlier failed attempts as the current status.
+
+Read artifacts/serverless-p2p/ONE-PHONE-LIVE-REPORT.md and IMPLEMENTATION-REPORT.md first. Raw final results and instrumentation are under one-phone-b45bfd8c606037b3/. Runner exit0; instrumentation code-1; nine native checks passed. Completion: 6 November2026,20:20:14 IST; total480,245ms.
+
+Passed: full-fragment native cold unlock, both descriptor publications, signed offline verified/pinned pairing and Signal sessions, bidirectional Tamil/emoji text and receipt, actual visible Direct Tor status/chat, exact file hashes both ways, actual microphone voice payload integrity both ways, app background70s with display off at native persistence and generic notification, automatic encrypted outbox recovery after laptop Tor stopped/restarted, and final service/Tor/process/monitor cleanup. Charging stay-awake restored to15. No adb reverse/forward or USB peer transport.
+
+Fixed: bootstrap/public-cache/publication/async Tor reply handling; authentication timing; misleading relay fallback label and stale test WebView session; native cleanup deleting sender chunks before send; nonblocking Tor process shutdown; main-thread lifecycle lock contention causing foreground-service startup deadline failures. A real device callback regression measured1ms while the engine lock was held.
+
+Final warm laptop-to-phone persistence samples:1,393ms and4,736ms including inspection overhead; not a latency guarantee. Recovery plus re-publication/receipt took235.140s. A failed/stopped initial-exchange attempt lasted651s and remains adverse evidence. See PHONE-STARTUP-ERRORS.md for earlier Keystore/service traces; the Keystore backend condition was not separately proven eliminated. No crypto downgrade or app-data reset was used.
+
+APK: artifacts/crypto-pigeon-standalone.apk;83,914,360bytes; app.cryptopigeon.nativeclient.debug; SHA256 62cfcebff4c3230dba53790c92fe82c38a99b7b169dcea3712faa5e162135015. Gates: full build/no Vite chunk warnings;28core+3desktop;6navigation/fragment;3Tor regressions;13JVM tests. changed-files.json contains46 current source digests. Backups: pre-serverless-p2p, pre-one-phone-tor and pre-visible-tor-status under artifacts/checkpoints. This archive has no Git repository.
+
+Guardrails for future work: preserve all user vaults/catalog/browser fragments and external segment files; never print secrets/private keys/passwords/raw Vault IDs; use isolated test roots; peer traffic must stay on actual Tor; only one phone is available. Keep the user updated after each phase. Rebuild if native/UI source changes; installed-APK reuse must verify its hash. Do not claim speaker playback, extended battery/OEM process-kill, reboot/automatic unlock, all attachment sizes or independent security-audit coverage. No current test is still running.

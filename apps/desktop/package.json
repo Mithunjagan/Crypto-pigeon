@@ -1,0 +1,80 @@
+{
+  "name": "@crypto-pigeon/desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Crypto Pigeon desktop client",
+  "author": "Crypto Pigeon",
+  "main": "main.cjs",
+  "scripts": {
+    "build": "node --check main.cjs && node --check preload.cjs && node --check setup.js",
+    "start": "electron .",
+    "test": "node --test test/*.test.cjs"
+  },
+  "devDependencies": {
+    "electron": "45.2.1",
+    "electron-builder": "26.18.0"
+  },
+  "build": {
+    "appId": "app.cryptopigeon.desktop",
+    "productName": "Crypto Pigeon",
+    "asar": true,
+    "npmRebuild": false,
+    "directories": {
+      "output": "../../artifacts/desktop"
+    },
+    "files": [
+      "main.cjs",
+      "policy.cjs",
+      "preload.cjs",
+      "setup.html",
+      "setup.js",
+      "setup.css",
+      "package.json",
+      "assets/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../../artifacts/desktop-runtime",
+        "to": "daemon"
+      },
+      {
+        "from": "../../artifacts/desktop-runtime/node_modules",
+        "to": "daemon/node_modules",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "Crypto-Pigeon-Setup-${version}-${arch}.${ext}",
+      "icon": "assets/pigeon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "category": "Network"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.social-networking"
+    }
+  }
+}

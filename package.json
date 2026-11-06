@@ -1,0 +1,49 @@
+{
+  "name": "crypto-pigeon",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Privacy-first E2EE chat MVP",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev:relay": "npm run dev --workspace=@crypto-pigeon/relay-server",
+    "relay:internet": "node scripts/start-internet-relay.mjs",
+    "dev:daemon": "npm run dev --workspace=@crypto-pigeon/local-daemon",
+    "dev:ui": "npm run dev --workspace=@crypto-pigeon/local-ui",
+    "demo:two-users": "node scripts/launch-two-users-local.mjs",
+    "admin": "npm run start --workspace=@crypto-pigeon/admin-cli --",
+    "build": "npm run build:shared && npm run build --workspaces",
+    "test": "npm run test --workspaces --if-present",
+    "test:unit": "npm run test --workspace=@crypto-pigeon/tests",
+    "typecheck": "npm run build --workspaces",
+    "docker:build": "docker compose build",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:reset-dev": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/reset-dev.ps1",
+    "verify": "npm run build && npm run test && npm run test:http && node scripts/check-diff.mjs",
+    "dev:daemon:mobile": "node scripts/mobile-daemon.mjs",
+    "android:build": "node scripts/android-build.mjs",
+    "android:usb": "node scripts/usb-mobile-deploy.mjs",
+    "build:shared": "npm run build --workspace=@crypto-pigeon/shared-types && npm run build --workspace=@crypto-pigeon/protocol",
+    "test:integration": "node scripts/feature-integration.mjs",
+    "setup:dev": "node scripts/setup-local-dev.mjs",
+    "desktop:dev": "node scripts/desktop-dev.mjs",
+    "desktop:smoke": "node scripts/run-desktop-smoke.mjs",
+    "desktop:prepare": "npm run build && node scripts/prepare-desktop.mjs",
+    "desktop:pack": "npm run desktop:prepare && npm exec --workspace=@crypto-pigeon/desktop -- electron-builder --dir",
+    "desktop:installer": "npm run desktop:prepare && npm exec --workspace=@crypto-pigeon/desktop -- electron-builder --win --x64",
+    "test:phones": "node scripts/two-phone-e2e.mjs",
+    "test:phones:internet": "node scripts/three-phone-live.mjs",
+    "test:phones:recovery": "node scripts/three-phone-recovery.mjs",
+    "test:phone-media": "node scripts/two-phone-media-check.mjs",
+    "test:http": "node scripts/daemon-http-check.mjs",
+    "android:native:fixtures": "node scripts/native-android-fixtures.mjs",
+    "android:native:build": "node scripts/android-native-build.mjs",
+    "test:android-native": "node scripts/native-android-check.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

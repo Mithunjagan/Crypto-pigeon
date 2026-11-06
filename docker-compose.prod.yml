@@ -1,0 +1,65 @@
+# Supply secrets at runtime; start only after arranging the VM/domain yourself.
+# docker compose --env-file .env -f docker-compose.prod.yml up -d --build
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    command: ["postgres", "-c", "max_connections=30"]
+    environment:
+      POSTGRES_DB: crypto_pigeon
+      POSTGRES_USER: crypto_pigeon
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crypto_pigeon -d crypto_pigeon"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    logging: &bounded-logs
+      driver: json-file
+      options: { max-size: "10m", max-file: "2" }
+  relay:
+    build:
+      context: .
+      dockerfile: apps/relay-server/Dockerfile
+    restart: unless-stopped
+    init: true
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: ${PORT:-8443}
+      DATABASE_URL: ${DATABASE_URL:-}
+      DATABASE_HOST: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX:-5}
+      PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:?set PUBLIC_RELAY_URL to your HTTPS origin}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:?set ADMIN_USERNAME}
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?set ADMIN_TOKEN}
+      ACTIVATION_PEPPER: ${ACTIVATION_PEPPER:?set ACTIVATION_PEPPER}
+      TRUST_PROXY: "1"
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: *bounded-logs
+  https:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      relay: { condition: service_healthy }
+    environment:
+      PUBLIC_RELAY_URL: ${PUBLIC_RELAY_URL:?set PUBLIC_RELAY_URL}
+      PORT: ${PORT:-8443}
+    ports: ["80:80", "443:443"]
+    volumes:
+      - ./apps/relay-server/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_prod_data:/data
+      - caddy_prod_config:/config
+    logging: *bounded-logs
+volumes:
+  postgres_prod_data:
+  caddy_prod_data:
+  caddy_prod_config:
